@@ -1,0 +1,25 @@
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+
+# Environment / secrets
+.env
+.env.*
+api_keys.py
+
+# Pickle / large data
+*.p
+*.pkl
+
+# Editors
+.vscode/
+.idea/

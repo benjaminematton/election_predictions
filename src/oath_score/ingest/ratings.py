@@ -19,6 +19,7 @@ warn or down-weight.
 
 from __future__ import annotations
 
+import io
 import json
 import re
 from dataclasses import dataclass
@@ -172,7 +173,9 @@ def _parse_ratings_table(
     one whose columns include 'District' (or starts with state/dist), 'CPVI'
     (or 'Cook PVI'), and at least one of {'Cook', 'Sabato', 'Inside'}.
     """
-    tables = pd.read_html(html, flavor="lxml")
+    # pandas >=3.0 requires StringIO for in-memory HTML; older versions
+    # accepted raw strings. Wrap defensively.
+    tables = pd.read_html(io.StringIO(html), flavor="lxml")
     target = _select_ratings_table(tables)
     if target is None:
         raise RuntimeError(
@@ -226,21 +229,48 @@ def _normalize_col(col: object) -> str:
 def _normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     df.columns = [_normalize_col(c) for c in df.columns]
-    # Standardize a few aliases
-    rename = {
-        "cook_pvi": "cpvi", "pvi": "cpvi",
-        "incumbent": "incumbent_raw",
-        "cook_political_report": "cook",
-        "sabato_s_crystal_ball": "sabato",
-        "inside_elections": "inside",
-        "race_to_the_wh": "rcp",  # sometimes labelled differently per cycle
-        "real_clear_politics": "rcp",
-        "538": "five38",
-        "fivethirtyeight": "five38",
-        "the_economist": "economist",
-    }
-    df = df.rename(columns={c: rename.get(c, c) for c in df.columns})
-    return df
+
+    # Wikipedia ratings tables often use date-stamped column names like
+    # "Cook (September 6, 2024)". Our normalizer turns those into
+    # "cook_september_6_2024". Strip everything after a prefix match.
+    forecaster_prefixes = (
+        ("cook", "cook"),
+        ("sabato", "sabato"),
+        ("inside", "inside"),
+        ("ie", "inside"),  # "IE" = Inside Elections in some cycles
+        ("politico", "politico"),
+        ("rcp", "rcp"),
+        ("real_clear", "rcp"),
+        ("race_to", "rcp"),
+        ("fox", "fox"),
+        ("ddhq", "ddhq"),
+        ("decision_desk", "ddhq"),
+        ("five38", "five38"),
+        ("538", "five38"),
+        ("fivethirtyeight", "five38"),
+        ("economist", "economist"),
+        ("the_economist", "economist"),
+        ("cnalysis", "cnalysis"),
+    )
+
+    new_names: dict[str, str] = {}
+    for col in df.columns:
+        # First, exact-prefix aliases for non-dated columns
+        if col in ("cook_pvi", "pvi"):
+            new_names[col] = "cpvi"
+            continue
+        if col == "incumbent":
+            new_names[col] = "incumbent_raw"
+            continue
+        # Then prefix-match against forecaster names
+        matched = None
+        for prefix, canonical in forecaster_prefixes:
+            if col == prefix or col.startswith(prefix + "_"):
+                matched = canonical
+                break
+        if matched is not None:
+            new_names[col] = matched
+    return df.rename(columns=new_names)
 
 
 _DISTRICT_RE = re.compile(

@@ -34,6 +34,22 @@ DEM_PARTY_LABELS = frozenset({"DEM", "DEMOCRAT", "DEMOCRATIC", "DFL", "DEMOCRATI
 REP_PARTY_LABELS = frozenset({"REP", "REPUBLICAN"})
 
 
+def _safe_fetch_pvi(cycle: int, raw_dir: Path) -> pd.DataFrame:
+    """Fetch Daily Kos PVI; return empty schema-correct DataFrame if unavailable.
+
+    Wikipedia ratings already supply CPVI for the ~180 competitive races, which
+    is the contested-race universe `features.py` filters to. Daily Kos is a
+    fallback for the remaining ~250 safe seats — useful for descriptive plots
+    but not strictly required for the model.
+    """
+    try:
+        return pvi.fetch_pvi(cycle, raw_dir)
+    except Exception as exc:
+        print(f"[features] Daily Kos PVI unavailable ({exc.__class__.__name__}); "
+              "proceeding with Wikipedia-CPVI only. This is fine for contested races.")
+        return pd.DataFrame(columns=["state_abbr", "district", "cpvi_signed", "map_version"])
+
+
 def build_features(cycle: int, snapshot: str, raw_dir: Path) -> pd.DataFrame:
     """End-to-end feature pipeline for one (cycle, snapshot)."""
     snap_date = snapshot_date_for(cycle, snapshot)
@@ -43,7 +59,7 @@ def build_features(cycle: int, snapshot: str, raw_dir: Path) -> pd.DataFrame:
     res_df = results.fetch_results(cycle, raw_dir)
     rat_res = ratings.fetch_ratings(cycle, snap_date, raw_dir)
     rat_df = rat_res.df
-    pvi_df = pvi.fetch_pvi(cycle, raw_dir)
+    pvi_df = _safe_fetch_pvi(cycle, raw_dir)
     acs_df = census.fetch_acs(cycle)
     fec_df = fec.fetch_fec(cycle, snap_date, raw_dir)
     ie_df = fec_ie.fetch_independent_expenditures(cycle, snap_date, raw_dir)

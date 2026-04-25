@@ -91,6 +91,12 @@ def _resolve_revision(
 ) -> tuple[int, str]:
     """Return (revision_id, timestamp_iso) for the latest revision <= snapshot.
 
+    For back-filled cycles (page created retroactively, after the cycle
+    happened) there ARE no revisions <= snapshot. In that case, fall back to
+    the earliest-ever revision of the page — which is the back-filled content
+    we want for those cycles. The caller can check `is_backfilled(cycle)` to
+    know whether the timestamp is contemporaneous.
+
     Caches the (cycle, snapshot) -> (revid, ts) mapping in
     data/raw/{cycle}/ratings_revisions.json.
     """
@@ -105,6 +111,31 @@ def _resolve_revision(
         return int(revid), ts
 
     title = PAGE_TITLE_FMT.format(cycle=cycle)
+
+    # Primary query: latest revision at or before the snapshot.
+    revid, ts = _query_revision(
+        title, rvstart=f"{snapshot.isoformat()}T23:59:59Z", rvdir="older"
+    )
+
+    # Back-fill fallback: if no pre-snapshot revision exists, take the
+    # earliest revision ever — that's the initial back-fill upload.
+    if revid is None and is_backfilled(cycle):
+        revid, ts = _query_revision(title, rvdir="newer")
+
+    if revid is None:
+        raise RuntimeError(
+            f"No revisions found for {title!r} at or before {snapshot}; page may not exist."
+        )
+
+    cache[key] = [revid, ts]
+    cache_path.write_text(json.dumps(cache, indent=2, sort_keys=True))
+    return revid, ts
+
+
+def _query_revision(
+    title: str, *, rvstart: str | None = None, rvdir: str = "older"
+) -> tuple[int | None, str | None]:
+    """Single-revision MediaWiki API call. Returns (None, None) if no revisions found."""
     params = {
         "action": "query",
         "format": "json",
@@ -112,24 +143,19 @@ def _resolve_revision(
         "titles": title,
         "rvprop": "ids|timestamp",
         "rvlimit": "1",
-        "rvstart": f"{snapshot.isoformat()}T23:59:59Z",
-        "rvdir": "older",
+        "rvdir": rvdir,
     }
+    if rvstart is not None:
+        params["rvstart"] = rvstart
     resp = requests.get(WIKI_API, params=params, headers={"User-Agent": USER_AGENT}, timeout=30)
     resp.raise_for_status()
-    payload = resp.json()
-    pages = payload["query"]["pages"]
+    pages = resp.json()["query"]["pages"]
     page = next(iter(pages.values()))
-    if "revisions" not in page or not page["revisions"]:
-        raise RuntimeError(
-            f"No revisions found for {title!r} at or before {snapshot}; page may not exist."
-        )
-    rev = page["revisions"][0]
-    revid, ts = int(rev["revid"]), rev["timestamp"]
-
-    cache[key] = [revid, ts]
-    cache_path.write_text(json.dumps(cache, indent=2, sort_keys=True))
-    return revid, ts
+    revs = page.get("revisions") or []
+    if not revs:
+        return None, None
+    rev = revs[0]
+    return int(rev["revid"]), rev["timestamp"]
 
 
 def _fetch_html(

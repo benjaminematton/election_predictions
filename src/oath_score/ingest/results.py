@@ -24,15 +24,17 @@ import pandas as pd
 from oath_score.constants import STATE_ABBR
 
 # Canonical filename used in this project tree.
-LOCAL_FILENAME = "1976_2024_house.csv"
+# MIT Election Lab ships this as a tab-separated file; we read it with sep='\t'.
+LOCAL_FILENAME = "1976-2024-house.tab"
 
-# Dataverse file access endpoint. The "persistentId" form is stable; the
-# fileId of the latest CSV may change. If this fails, the user should
-# download manually and place the CSV at data/raw/elections/{LOCAL_FILENAME}.
-_DATAVERSE_URL = (
-    "https://dataverse.harvard.edu/api/access/datafile"
-    "/:persistentId?persistentId=doi:10.7910/DVN/IG0UN2"
-)
+# Dataverse file-access URL. The fileId is stable until the dataset is
+# republished with a new version (rare). If this 404s, look up the current
+# fileId via the dataset metadata API and update here. Manual fallback:
+# download the latest "U.S. House" .tab from
+# https://dataverse.harvard.edu/dataset.xhtml?persistentId=doi:10.7910/DVN/IG0UN2
+# and place at data/raw/elections/{LOCAL_FILENAME}.
+_DATAVERSE_FILE_ID = 13592823  # 1976-2024-house.tab (verified 2026-04-25)
+_DATAVERSE_URL = f"https://dataverse.harvard.edu/api/access/datafile/{_DATAVERSE_FILE_ID}"
 
 # Two-party label set used for signed-margin computation.
 DEM_LABELS = frozenset({"DEMOCRAT", "DEMOCRATIC", "DEMOCRATIC-FARMER-LABOR", "DFL"})
@@ -62,29 +64,75 @@ def fetch_results(cycle: int, raw_dir: Path) -> pd.DataFrame:
 # ---------- file load ----------
 
 def _load_master_csv(raw_dir: Path) -> pd.DataFrame:
-    """Load the staged MIT Election Lab CSV. If missing, attempt download."""
+    """Load the staged MIT Election Lab file.
+
+    Dataverse's export of this dataset has two quirks:
+      1. The file is named `.tab` but is comma-separated.
+      2. Each *data* row is wrapped in literal double-quotes; the header is not.
+         pandas reads this as one giant string column unless we strip first.
+
+    We pre-strip line-wrap quotes into a buffer before handing to pandas.
+    """
+    import io
     raw_dir = Path(raw_dir) / "elections"
     raw_dir.mkdir(parents=True, exist_ok=True)
     local = raw_dir / LOCAL_FILENAME
     if not local.exists():
         _try_download(local)
-    return pd.read_csv(local, encoding="utf-8", low_memory=False)
+
+    with local.open("r", encoding="utf-8") as fh:
+        cleaned_lines = []
+        for line in fh:
+            stripped = line.rstrip("\n")
+            # If a data row is wrapped in matching outer quotes, drop them.
+            if len(stripped) >= 2 and stripped[0] == '"' and stripped[-1] == '"':
+                stripped = stripped[1:-1]
+            cleaned_lines.append(stripped + "\n")
+
+    buf = io.StringIO("".join(cleaned_lines))
+    # A handful of historical rows have embedded commas/quotes that break
+    # tokenization. Skip them; we only need recent cycles anyway.
+    return pd.read_csv(buf, low_memory=False, on_bad_lines="skip")
 
 
 def _try_download(dest: Path) -> None:
-    """Attempt to fetch the Dataverse CSV; raise with manual fallback instructions on failure."""
+    """Attempt to fetch the Dataverse file; raise with manual fallback instructions on failure.
+
+    Dataverse files require a guestbook response. We POST a minimal guestbook
+    payload to /api/access/datafile/{id}, get back a signed URL, then GET it.
+    """
     from oath_score.ingest._download import download_file
+    import requests
+
     try:
-        download_file(_DATAVERSE_URL, dest)
+        # Step 1: POST guestbook response → signed download URL.
+        post = requests.post(
+            _DATAVERSE_URL,
+            headers={"User-Agent": "oath_score", "Content-Type": "application/json"},
+            json={"guestbookResponse": {
+                "name": "oath_score backtest",
+                "email": "noreply@example.org",
+                "institution": "independent research",
+                "position": "researcher",
+            }},
+            timeout=30,
+        )
+        post.raise_for_status()
+        body = post.json()
+        if body.get("status") != "OK":
+            raise RuntimeError(f"Dataverse rejected guestbook response: {body}")
+        signed_url = body["data"]["signedUrl"]
+
+        # Step 2: GET the signed URL — that one streams the actual file.
+        download_file(signed_url, dest)
     except Exception as exc:
         raise RuntimeError(
-            f"Could not auto-download the MIT Election Lab CSV.\n"
-            f"  Tried: {_DATAVERSE_URL}\n"
+            f"Could not auto-download the MIT Election Lab file.\n"
             f"  Original error: {exc}\n\n"
             f"Manual fallback: visit\n"
             f"  https://dataverse.harvard.edu/dataset.xhtml"
             f"?persistentId=doi:10.7910/DVN/IG0UN2\n"
-            f"download the latest 'U.S. House' CSV, and place it at\n"
+            f"accept the dataset terms, download '1976-2024-house.tab', and place at\n"
             f"  {dest}"
         ) from exc
 

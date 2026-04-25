@@ -173,7 +173,7 @@ class MultiQuantileCompetitiveness:
         X = X.fillna(0.0)
         return X.to_numpy()
 
-    # ----- diagnostics -----
+    # ----- diagnostics + raw predictions -----
 
     @property
     def crossing_rate(self) -> float:
@@ -185,3 +185,28 @@ class MultiQuantileCompetitiveness:
     @property
     def feature_columns(self) -> tuple[str, ...]:
         return self._feature_cols
+
+    def predict_quantiles(self, df: pd.DataFrame) -> np.ndarray:
+        """Return the full per-row quantile-prediction matrix.
+
+        Shape: (len(df), len(self.quantiles)). Rows that aren't in the
+        scorable universe (non-Dem, or Dem without cook for the naive set)
+        get a row of NaN. Quantiles are post-sorted to repair crossings.
+
+        Stakes MC consumes these directly via inverse-CDF sampling.
+        """
+        if not self._models:
+            raise RuntimeError("call .fit() first")
+
+        out = np.full((len(df), len(self.quantiles)), np.nan, dtype=float)
+        scorable = self._scorable_mask(df)
+        if not scorable.any():
+            return out
+
+        d = df.loc[scorable].copy()
+        X = self._featurize(d)
+        X_scaled = self._scaler.transform(X) if self._scaler is not None else X
+        preds = np.column_stack([m.predict(X_scaled) for m in self._models])
+        preds_fixed = np.sort(preds, axis=1)
+        out[scorable.to_numpy(), :] = preds_fixed
+        return out

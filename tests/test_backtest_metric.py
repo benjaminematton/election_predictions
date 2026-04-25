@@ -63,6 +63,7 @@ def _make_row(**overrides) -> BacktestRow:
     defaults = dict(
         feature_set="naive",
         model="logistic",
+        combine="competitiveness",
         snapshot="T-60",
         test_cycle=2024,
         train_cycles=(2022,),
@@ -73,6 +74,8 @@ def _make_row(**overrides) -> BacktestRow:
         headline_n=10,
         headline_model_ci=(0.40, 0.60),
         headline_fund_ci=(0.20, 0.40),
+        pivotal_dollar_share=None,
+        pivotal_ci=None,
         bootstrap_reps=100,
         notes="",
         timestamp="2026-01-01T00:00:00+00:00",

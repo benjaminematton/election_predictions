@@ -52,6 +52,9 @@ FUND_COL = "total_trans"
 
 UniverseChoice = str  # "all" | "wikipedia"
 ModelChoice = str      # "logistic" | "multi-quantile"
+CombineChoice = str    # "competitiveness" | "base"
+
+PIVOTAL_COL = "__is_pivotal__"
 
 
 def _build_model(model: ModelChoice, feature_set: str):
@@ -79,6 +82,7 @@ class NMetric:
 class BacktestRow:
     feature_set: str
     model: str                                # "logistic" | "multi-quantile"
+    combine: str                              # "competitiveness" | "base"
     snapshot: str
     test_cycle: int
     train_cycles: tuple[int, ...]
@@ -88,6 +92,8 @@ class BacktestRow:
     headline_n: int                          # which N in metrics is the canonical one
     headline_model_ci: tuple[float, float]   # (low, high) at 95% confidence
     headline_fund_ci: tuple[float, float]
+    pivotal_dollar_share: float | None       # secondary metric, None if combine=competitiveness
+    pivotal_ci: tuple[float, float] | None
     bootstrap_reps: int
     notes: str
     timestamp: str
@@ -96,6 +102,7 @@ class BacktestRow:
         return {
             "feature_set": self.feature_set,
             "model": self.model,
+            "combine": self.combine,
             "snapshot": self.snapshot,
             "test_cycle": self.test_cycle,
             "train_cycles": list(self.train_cycles),
@@ -105,6 +112,8 @@ class BacktestRow:
             "headline_n": self.headline_n,
             "headline_model_ci": list(self.headline_model_ci),
             "headline_fund_ci": list(self.headline_fund_ci),
+            "pivotal_dollar_share": self.pivotal_dollar_share,
+            "pivotal_ci": list(self.pivotal_ci) if self.pivotal_ci is not None else None,
             "bootstrap_reps": self.bootstrap_reps,
             "notes": self.notes,
             "timestamp": self.timestamp,
@@ -189,19 +198,32 @@ def run_backtest(
     processed_dir: Path,
     model: ModelChoice = "logistic",
     universe: UniverseChoice = "all",
+    combine: CombineChoice = "competitiveness",
+    raw_dir: Path = Path("data/raw"),
     headline_n: int = HEADLINE_N,
     n_grid: tuple[int, ...] = N_GRID,
     bootstrap_reps: int = BOOTSTRAP_REPS,
     bootstrap_seed: int = BOOTSTRAP_SEED,
     notes: str = "",
 ) -> BacktestRow:
-    """Fit on `train_cycles`, score `test_cycle`, return a BacktestRow."""
+    """Fit on `train_cycles`, score `test_cycle`, return a BacktestRow.
+
+    `combine="base"` adds chamber-control stakes to the score:
+      base = sqrt(competitiveness * stakes_normalized)
+    Requires `model="multi-quantile"` (only that model exposes the per-race
+    predictive distribution stakes needs).
+    """
     if feature_set not in FEATURE_REGISTRY:
         raise KeyError(
             f"unknown feature_set={feature_set!r}; have {sorted(FEATURE_REGISTRY)}"
         )
     if headline_n not in n_grid:
         raise ValueError(f"headline_n={headline_n} must be in n_grid={n_grid}")
+    if combine == "base" and model != "multi-quantile":
+        raise ValueError(
+            "combine='base' requires model='multi-quantile' "
+            "(logistic doesn't expose the per-race predictive distribution)"
+        )
 
     train_df = pd.concat(
         [load_processed(c, snapshot, processed_dir) for c in train_cycles],
@@ -216,6 +238,17 @@ def run_backtest(
     dems[ORACLE_COL] = (dems["margin_pct"].abs() < 0.05).astype(float)
     n_dem = len(dems)
 
+    pivotal_share: float | None = None
+    pivotal_ci: tuple[float, float] | None = None
+    if combine == "base":
+        dems = _apply_stakes_combine(
+            dems=dems, fitted_model=fitted, snapshot=snapshot,
+            test_cycle=test_cycle, raw_dir=raw_dir,
+        )
+        pivotal_share, pivotal_ci = _pivotal_metric_with_ci(
+            dems, headline_n, bootstrap_reps, bootstrap_seed
+        )
+
     metrics = tuple(_scores_at_n(dems, n) for n in n_grid)
 
     model_ci = _bootstrap_ci(dems, SCORE_COL, headline_n, bootstrap_reps, bootstrap_seed)
@@ -224,6 +257,7 @@ def run_backtest(
     return BacktestRow(
         feature_set=feature_set,
         model=model,
+        combine=combine,
         snapshot=snapshot,
         test_cycle=test_cycle,
         train_cycles=tuple(train_cycles),
@@ -233,10 +267,89 @@ def run_backtest(
         headline_n=headline_n,
         headline_model_ci=model_ci,
         headline_fund_ci=fund_ci,
+        pivotal_dollar_share=pivotal_share,
+        pivotal_ci=pivotal_ci,
         bootstrap_reps=bootstrap_reps,
         notes=notes,
         timestamp=datetime.now(timezone.utc).isoformat(timespec="seconds"),
     )
+
+
+def _apply_stakes_combine(
+    *,
+    dems: pd.DataFrame,
+    fitted_model,
+    snapshot: str,
+    test_cycle: int,
+    raw_dir: Path,
+) -> pd.DataFrame:
+    """Run the stakes MC and replace SCORE_COL with sqrt(comp * stakes)."""
+    from oath_score.scores.chamber import build_chamber
+    from oath_score.scores.stakes import (
+        PIVOTAL_THRESHOLD, StakesSimulator, sigma_for_snapshot,
+    )
+    import numpy as np
+
+    chamber = build_chamber(test_cycle, raw_dir)
+    uncontested_d = chamber.deterministic_d_count()
+
+    quantile_levels = np.array(fitted_model.quantiles)
+    quantile_preds = fitted_model.predict_quantiles(dems)  # (n_dems, n_q)
+
+    # Dynamic-median threshold (chamber_threshold=None): asks "is this seat
+    # pivotal to whether D performs above- or below-median across MC draws?"
+    # The literal 218-seat threshold is often unreachable in our truncated
+    # contested universe, which would zero out all stakes. The median-relative
+    # framing is the donor-relevant question anyway.
+    sim = StakesSimulator(sigma=sigma_for_snapshot(snapshot), chamber_threshold=None)
+    result = sim.simulate(
+        contested_quantiles=quantile_preds,
+        quantile_levels=quantile_levels,
+        uncontested_d_count=uncontested_d,
+    )
+
+    dems = dems.copy()
+    competitiveness = dems[SCORE_COL].copy()
+    stakes_norm = pd.Series(result.stakes_normalized, index=dems.index)
+    dems["__stakes_raw__"] = result.stakes_raw
+    dems["__stakes_norm__"] = stakes_norm
+    dems[PIVOTAL_COL] = (np.abs(result.stakes_raw) > PIVOTAL_THRESHOLD).astype(float)
+    # Combined score replaces SCORE_COL so the existing allocation/metric path
+    # picks up the impact base score automatically.
+    dems[SCORE_COL] = np.sqrt(
+        competitiveness.clip(lower=0.0, upper=1.0).fillna(0.0)
+        * stakes_norm.clip(lower=0.0, upper=1.0).fillna(0.0)
+    )
+    return dems
+
+
+def _pivotal_metric(allocations: pd.DataFrame) -> float:
+    """Fraction of dollars sent to seats flagged pivotal."""
+    if PIVOTAL_COL not in allocations.columns or allocations.empty:
+        return 0.0
+    total = float(allocations["allocation"].sum())
+    if total <= 0:
+        return 0.0
+    pivotal_dollars = float((allocations["allocation"] * allocations[PIVOTAL_COL]).sum())
+    return pivotal_dollars / total
+
+
+def _pivotal_metric_with_ci(
+    dems: pd.DataFrame, n: int, reps: int, seed: int
+) -> tuple[float, tuple[float, float]]:
+    """Bootstrap-CI of pivotal_dollar_share at top-N model allocation."""
+    rng = np.random.default_rng(seed)
+    samples = np.empty(reps, dtype=float)
+    for i in range(reps):
+        boot = dems.sample(n=len(dems), replace=True, random_state=rng.integers(1, 10**9))
+        alloc = allocate(boot, score_col=SCORE_COL, n=n)
+        samples[i] = _pivotal_metric(alloc)
+    point = float(_pivotal_metric(allocate(dems, score_col=SCORE_COL, n=n)))
+    ci = (
+        round(float(np.percentile(samples, 2.5)), 4),
+        round(float(np.percentile(samples, 97.5)), 4),
+    )
+    return round(point, 4), ci
 
 
 def append_jsonl(row: BacktestRow, out_path: Path) -> None:
@@ -250,7 +363,7 @@ def format_row(row: BacktestRow) -> str:
     """Pretty-print a row including N sweep + headline CI."""
     lines = [
         f"[backtest] feature_set={row.feature_set} model={row.model} "
-        f"snapshot={row.snapshot} "
+        f"combine={row.combine} snapshot={row.snapshot} "
         f"test={row.test_cycle} train={list(row.train_cycles)} universe={row.universe}",
         f"  universe size: {row.n_dem_candidates} Dems",
         f"  {'N':>4} {'model':>8} {'fund':>8} {'oracle':>8} {'Δ':>8}",
@@ -272,6 +385,11 @@ def format_row(row: BacktestRow) -> str:
         f"(95% CI [{row.headline_fund_ci[0]:.4f}, {row.headline_fund_ci[1]:.4f}]) "
         f"→ Δ {head_sign}{head_delta:.4f}"
     )
+    if row.pivotal_dollar_share is not None and row.pivotal_ci is not None:
+        lines.append(
+            f"  pivotal_dollar_share: {row.pivotal_dollar_share:.4f} "
+            f"(95% CI [{row.pivotal_ci[0]:.4f}, {row.pivotal_ci[1]:.4f}])"
+        )
     return "\n".join(lines)
 
 
@@ -305,6 +423,12 @@ def main() -> None:
                         help="candidate universe; default 'all' (Dems in any "
                              "contested two-party general); 'wikipedia' "
                              "restricts to Dems in Wikipedia-tracked races")
+    parser.add_argument("--combine", choices=("competitiveness", "base"),
+                        default="competitiveness",
+                        help="score combination; 'base' adds chamber-control "
+                             "stakes (requires --model multi-quantile)")
+    parser.add_argument("--raw-dir", type=Path, default=Path("data/raw"),
+                        help="raw data dir for chamber view (used by --combine base)")
     parser.add_argument("--headline-n", type=int, default=HEADLINE_N,
                         help=f"top-N for the headline number; default {HEADLINE_N}")
     parser.add_argument("--bootstrap-reps", type=int, default=BOOTSTRAP_REPS,
@@ -325,10 +449,12 @@ def main() -> None:
         row = run_backtest(
             feature_set=args.features,
             model=args.model,
+            combine=args.combine,
             snapshot=snap,
             train_cycles=train_cycles,
             test_cycle=args.test,
             processed_dir=args.processed_dir,
+            raw_dir=args.raw_dir,
             universe=args.universe,
             headline_n=args.headline_n,
             bootstrap_reps=args.bootstrap_reps,

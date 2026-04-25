@@ -32,7 +32,7 @@ from oath_score.ingest._download import download_file
 
 IE_URL = "https://www.fec.gov/files/bulk-downloads/{cycle}/independent_expenditure_{cycle}.csv"
 
-EXP_DATE_FMT = "%m/%d/%Y"  # FEC's Schedule E CSV uses slashes; differs from indiv/pas
+EXP_DATE_FMT = "%d-%b-%y"  # FEC's Schedule E CSV uses DD-MON-YY (e.g. "27-SEP-24")
 
 
 @dataclass(frozen=True)
@@ -92,7 +92,8 @@ def fetch_independent_expenditures(
 
     # Snapshot filter — disbursement date must be on or before snapshot.
     parsed = pd.to_datetime(df["EXP_DATE"], format=EXP_DATE_FMT, errors="coerce")
-    df = df.loc[parsed.notna() & (parsed.dt.date <= snapshot)].copy()
+    snap_ts = pd.Timestamp(snapshot)
+    df = df.loc[parsed.notna() & (parsed <= snap_ts)].copy()
 
     df["EXP_AMO"] = pd.to_numeric(df["EXP_AMO"], errors="coerce").fillna(0)
     df["SUP_OPP"] = df["SUP_OPP"].astype(str).str.upper().str.strip()

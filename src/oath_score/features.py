@@ -116,8 +116,11 @@ def _normalize_results(res_df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def _party_major(p: str) -> str | None:
-    pu = (p or "").upper()
+def _party_major(p: object) -> str | None:
+    """Map a raw party string (or NaN) to one of {'D', 'R', None}."""
+    if p is None or (isinstance(p, float) and pd.isna(p)):
+        return None
+    pu = str(p).upper().strip()
     if pu in DEM_PARTY_LABELS:
         return "D"
     if pu in REP_PARTY_LABELS:
@@ -246,10 +249,25 @@ def _apply_contested_race_filter(df: pd.DataFrame) -> pd.DataFrame:
     df = df.loc[df["party_major"].isin(["D", "R"])].copy()
     df = df.loc[df["cand_id"].notna()].copy()
     df = df.loc[df["margin_pct_signed"].between(-0.999999, 0.999999)].copy()
+    if df.empty:
+        return df
 
-    # Each (state, district) must have exactly 2 candidates after the above
-    counts = df.groupby(["state_abbr", "district"]).size()
-    valid_districts = counts[counts == 2].index
+    # FEC fuzzy matches can attach multiple committees to one MIT candidate;
+    # keep the one with the highest total_trans (most active committee) per
+    # (state, district, party_major).
+    df["total_trans"] = pd.to_numeric(df["total_trans"], errors="coerce").fillna(0)
+    df = (
+        df.sort_values("total_trans", ascending=False)
+          .drop_duplicates(["state_abbr", "district", "party_major"], keep="first")
+          .reset_index(drop=True)
+    )
+
+    # Each (state, district) must have one D and one R after the above.
+    party_sets = df.groupby(["state_abbr", "district"])["party_major"].apply(set)
+    valid_mask = party_sets.apply(lambda s: s == {"D", "R"})
+    valid_districts = party_sets[valid_mask].index
+    if len(valid_districts) == 0:
+        return df.iloc[0:0]
     df = df.set_index(["state_abbr", "district"]).loc[valid_districts].reset_index()
     return df
 
@@ -259,6 +277,15 @@ def _apply_contested_race_filter(df: pd.DataFrame) -> pd.DataFrame:
 def _compute_derived_columns(df: pd.DataFrame) -> pd.DataFrame:
     """Compute log fundraising, opponent features, incumbent flag, signed margin."""
     df = df.copy()
+    if df.empty:
+        # Filter dropped everything; return empty frame with the expected columns
+        # so downstream code (assertions, parquet write) still has a valid schema.
+        for col in ("margin_pct", "incumbent", "self_raised_log", "opp_raised",
+                    "opp_raised_log", "self_raised_pct", "ie_for_log",
+                    "ie_against_log", "cook_rating", "total_trans"):
+            if col not in df.columns:
+                df[col] = pd.Series(dtype="float64")
+        return df
 
     # Single source of truth: signed margin (D% - R%)
     df["margin_pct"] = df["margin_pct_signed"]
@@ -304,6 +331,10 @@ def _compute_derived_columns(df: pd.DataFrame) -> pd.DataFrame:
         on=["state_abbr", "district"],
         how="left",
     )
+    # Defensive: pivot only produces columns for parties present; backfill any missing.
+    for col in ("raised_D", "raised_R"):
+        if col not in df.columns:
+            df[col] = 0.0
     df["opp_raised"] = np.where(df["party_major"] == "D", df["raised_R"], df["raised_D"])
     df["opp_raised_log"] = np.log1p(df["opp_raised"])
     denom = df["total_trans"] + df["opp_raised"]

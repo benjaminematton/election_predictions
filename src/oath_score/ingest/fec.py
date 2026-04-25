@@ -135,7 +135,10 @@ def _filter_by_snapshot(
     FEC stores dates as MMDDYYYY strings; bad/missing values exist.
     """
     parsed = pd.to_datetime(df[date_col], format=FEC_DATE_FMT, errors="coerce")
-    mask = parsed.notna() & (parsed.dt.date <= snapshot)
+    # Compare as Timestamps (not Python date objects) — pandas refuses the
+    # cross-type comparison on newer versions.
+    snap_ts = pd.Timestamp(snapshot)
+    mask = parsed.notna() & (parsed <= snap_ts)
     return df.loc[mask].copy()
 
 

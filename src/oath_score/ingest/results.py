@@ -178,11 +178,23 @@ _PUNCT_RE = re.compile(r"[^A-Z\s\-']")
 
 
 def _extract_last_name(s: str) -> str:
-    """MIT format is 'LAST, FIRST' or 'LAST, FIRST MIDDLE'. Take the comma-prefix."""
+    """Extract the surname from an MIT Election Lab candidate string.
+
+    Two formats appear across years:
+      * 'LAST, FIRST [MIDDLE]'  (older cycles) → take the part before the comma
+      * 'FIRST [MIDDLE] LAST'   (recent cycles, e.g. 2024) → take the last token
+
+    Both lower-case, punctuation-stripped, uppercased.
+    """
     if not s:
         return ""
     upper = s.upper().strip()
-    head = upper.split(",", 1)[0]
+    if "," in upper:
+        head = upper.split(",", 1)[0]
+    else:
+        # No comma → "FIRST [MIDDLE] LAST"; take the trailing whitespace token.
+        parts = upper.split()
+        head = parts[-1] if parts else ""
     return _PUNCT_RE.sub("", head).strip()
 
 

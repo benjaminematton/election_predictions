@@ -7,10 +7,13 @@ Monte Carlo), and a **financial-need** adjustment (quantile-regression
 viable-spend floor). The score is back-tested at three pre-election snapshots
 (T-110, T-60, T-20) per cycle, then served via a Streamlit UI.
 
-**Status: Phase 1 — skeleton complete.** Package layout, ingestion module
-refactor (Census ACS, FEC bulk contributions, OpenSecrets dark-money), feature-set
-registry for the improvement curve, and snapshot-date arithmetic are in place.
-Smoke-tested via `tests/`. No model code yet.
+**Status: Phase 2 — ingestion + features complete.**
+Snapshot-aware ingestion for ACS demographics, FEC contributions and Schedule E
+independent expenditures, MIT Election Lab district results, Cook/Sabato/Inside
+race ratings (via MediaWiki revision API), and Daily Kos CPVI (both pre- and
+post-2020 maps). End-to-end `features.build_features(cycle, snapshot)` joins
+all six sources and applies the contested-race filter. Model code (Phases 4–7)
+and Streamlit UI (Phase 8) not yet built.
 
 **Cycles covered:** 2014, 2016, 2022, 2024.
 
@@ -24,15 +27,32 @@ Smoke-tested via `tests/`. No model code yet.
 src/oath_score/
   constants.py        # cycles, snapshot offsets, election dates
   feature_sets.py     # parent-chain registry driving the improvement curve
-  ingest/             # census, fec, opensecrets (Phase 2 will add fec_ie, results, ratings, pvi)
-  scores/             # Phase 4-6: competitiveness, stakes, financial_need, impact
-tests/                # snapshot-date and feature-ladder pins
+  features.py         # join + contested-race filter → per-(cycle, snapshot) matrix
+  ingest/             # _download, census, fec, fec_ie, opensecrets, pvi, ratings, results
+  scores/             # Phase 4-6: competitiveness, stakes, financial_need, impact (TBD)
+tests/                # 78 tests, ~250 LOC, no network
 ```
 
-## Run the smoke tests
+## Setup
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -e ".[ml,ui,dev]"
+export CENSUS_API_KEY=...   # https://api.census.gov/data/key_signup.html
+```
+
+## Run the tests
 
 ```bash
 pytest -q
+```
+
+## Run the ingestion pipeline (downloads ~1GB FEC bulk files)
+
+```bash
+python -m oath_score.ingest.fec --cycle 2024 --snapshot 2024-09-06
+python -m oath_score.features --cycle 2024 --snapshot T-60
 ```
 
 ## Full plan

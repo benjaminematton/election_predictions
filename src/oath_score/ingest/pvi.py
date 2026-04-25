@@ -112,25 +112,28 @@ def _find_col(df: pd.DataFrame, keywords: list[str]) -> str | None:
 
 
 def _parse_dailykos_district(s: str) -> tuple[str, int] | None:
-    """Daily Kos district format varies: 'AL-01', 'AL-1', 'Alabama 1', 'AK-AL'."""
+    """Daily Kos district format varies: 'AL-01', 'AL-1', 'Alabama 1',
+    'AK-AL', 'Alaska At-Large'."""
     if not s or s.lower() == "nan":
         return None
     s = s.strip()
 
+    # Try dash-form first; if the head doesn't resolve to a state, fall through
+    # to space-form (handles e.g. "Alaska At-Large" where "At-Large" contains
+    # a dash but the leading token is the state name with a space).
     if "-" in s:
         head, tail = s.split("-", 1)
         head = head.strip().upper()
         tail = tail.strip().upper()
-        # State part: 2-letter abbr, or full name
         abbr = head if len(head) == 2 else _NAME_TO_ABBR.get(head)
-        if abbr is None:
-            return None
-        if tail in ("AL", "AT-LARGE", "ATLARGE"):
-            return abbr, 0
-        try:
-            return abbr, int(tail)
-        except ValueError:
-            return None
+        if abbr is not None:
+            if tail in ("AL", "AT-LARGE", "ATLARGE"):
+                return abbr, 0
+            try:
+                return abbr, int(tail)
+            except ValueError:
+                return None
+        # else fall through to space-form
 
     # "Alabama 1" / "Alaska At-Large" form
     parts = s.rsplit(" ", 1)

@@ -178,6 +178,14 @@ class NaiveCompetitiveness:
             X["cook_rating"] = -(X["cook_rating"] - 4.0).abs()
         return X.to_numpy()
 
+    @property
+    def transformed_feature_names(self) -> tuple[str, ...]:
+        """Names of the columns the model actually saw, after _featurize."""
+        return tuple(
+            "cook_distance_from_tossup_neg" if c == "cook_rating" else c
+            for c in self._feature_cols
+        )
+
     def score(self, df: pd.DataFrame) -> pd.DataFrame:
         """Convenience: attach SCORE_COL to a copy of df."""
         out = df.copy()
@@ -192,6 +200,12 @@ class NaiveCompetitiveness:
 
     @property
     def coef_(self) -> dict[str, float]:
+        """Coefficients keyed by the *transformed* feature names the model saw.
+
+        Specifically, `cook_rating` becomes `cook_distance_from_tossup_neg`
+        so consumers don't get misled into thinking +1.0 means 'higher cook
+        ordinal → higher score' when it actually means 'closer to Tossup → higher score'.
+        """
         if self._model is None:
             return {}
-        return dict(zip(self._feature_cols, self._model.coef_[0]))
+        return dict(zip(self.transformed_feature_names, self._model.coef_[0]))

@@ -1,14 +1,24 @@
 """End-to-end backtest harness.
 
-Loads per-(cycle, snapshot) feature matrices, fits a competitiveness model on
-the training cycle(s), scores Dem candidates in the test cycle, runs the
-allocation function, and computes the headline metric for the model and two
-reference lines (fundraising-proportional baseline, hindsight oracle).
+For one (feature_set, snapshot, train_cycles, test_cycle, universe) tuple:
+  * Fit the competitiveness model on training cycles.
+  * Score Dem candidates in the test cycle.
+  * For each N in N_GRID, run the allocation function and compute the
+    headline metric for the model and two reference lines (fundraising
+    baseline, hindsight oracle).
+  * Bootstrap a 95% CI on the model and fundraising scores at the default
+    headline N, so the curve has uncertainty bars from day one.
 
-The Cook-final benchmark is deferred to Phase 7 — it needs a separate ratings
-fetch at election-1week, which we'll add when we close out the calibration step.
+Universe options (`--universe` / `universe=`):
+  * "all"       - every Dem candidate in a contested two-party general
+                  election (default; the honest measurement).
+  * "wikipedia" - restrict to Dems in Wikipedia-tracked races (matches
+                  Oath's product surface but inflates fundraising baseline).
 
-One row per call is appended to data/processed/backtest_results.jsonl, which is
+The Cook-final benchmark is deferred to Phase 7 — it needs a separate
+ratings fetch at election-1week.
+
+One row per call is appended to data/processed/backtest_results.jsonl,
 git-tracked so the improvement curve is visible in repo history.
 """
 
@@ -16,11 +26,12 @@ from __future__ import annotations
 
 import argparse
 import json
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable
 
+import numpy as np
 import pandas as pd
 
 from oath_score.allocation import allocate, metric_pct_to_close_races
@@ -29,7 +40,27 @@ from oath_score.feature_sets import get as get_feature_set
 from oath_score.scores.competitiveness import NaiveCompetitiveness, SCORE_COL
 
 
+# Range of top-N values to sweep per backtest row.
+N_GRID: tuple[int, ...] = (1, 3, 5, 10, 20, 50)
+HEADLINE_N: int = 10
+BOOTSTRAP_REPS: int = 1000
+BOOTSTRAP_SEED: int = 42
+
+ORACLE_COL = "__oracle_score__"
+FUND_COL = "total_trans"
+
+UniverseChoice = str  # "all" | "wikipedia"
+
+
 # ----- result row -----
+
+@dataclass(frozen=True)
+class NMetric:
+    n: int
+    model_score: float
+    fundraising_score: float
+    oracle_score: float
+
 
 @dataclass(frozen=True)
 class BacktestRow:
@@ -37,18 +68,36 @@ class BacktestRow:
     snapshot: str
     test_cycle: int
     train_cycles: tuple[int, ...]
-    n: int                              # top-N used in allocation
-    n_dem_candidates: int               # universe size before top-N
-    model_score: float
-    fundraising_score: float
-    oracle_score: float
+    universe: UniverseChoice
+    n_dem_candidates: int
+    metrics: tuple[NMetric, ...]            # one entry per N in N_GRID
+    headline_n: int                          # which N in metrics is the canonical one
+    headline_model_ci: tuple[float, float]   # (low, high) at 95% confidence
+    headline_fund_ci: tuple[float, float]
+    bootstrap_reps: int
     notes: str
     timestamp: str
 
     def as_dict(self) -> dict:
-        d = asdict(self)
-        d["train_cycles"] = list(self.train_cycles)
-        return d
+        return {
+            "feature_set": self.feature_set,
+            "snapshot": self.snapshot,
+            "test_cycle": self.test_cycle,
+            "train_cycles": list(self.train_cycles),
+            "universe": self.universe,
+            "n_dem_candidates": self.n_dem_candidates,
+            "metrics": [asdict(m) for m in self.metrics],
+            "headline_n": self.headline_n,
+            "headline_model_ci": list(self.headline_model_ci),
+            "headline_fund_ci": list(self.headline_fund_ci),
+            "bootstrap_reps": self.bootstrap_reps,
+            "notes": self.notes,
+            "timestamp": self.timestamp,
+        }
+
+    @property
+    def headline(self) -> NMetric:
+        return next(m for m in self.metrics if m.n == self.headline_n)
 
 
 # ----- public API -----
@@ -64,6 +113,49 @@ def load_processed(cycle: int, snapshot: str, processed_dir: Path) -> pd.DataFra
     return pd.read_parquet(path)
 
 
+def _filter_universe(df: pd.DataFrame, universe: UniverseChoice) -> pd.DataFrame:
+    """Apply the universe filter to scored Dem candidates."""
+    dems = df.loc[df["party_major"] == "D"].copy()
+    if universe == "wikipedia":
+        dems = dems.loc[dems["cook_rating"].notna()].copy()
+    elif universe != "all":
+        raise ValueError(f"unknown universe={universe!r}; want 'all' or 'wikipedia'")
+    return dems
+
+
+def _scores_at_n(dems: pd.DataFrame, n: int) -> NMetric:
+    """Compute model / fund / oracle metrics at one N."""
+    model_alloc = allocate(dems, score_col=SCORE_COL, n=n)
+    fund_alloc = allocate(dems, score_col=FUND_COL, n=n)
+    oracle_alloc = allocate(dems, score_col=ORACLE_COL, n=n)
+    return NMetric(
+        n=n,
+        model_score=round(metric_pct_to_close_races(model_alloc), 4),
+        fundraising_score=round(metric_pct_to_close_races(fund_alloc), 4),
+        oracle_score=round(metric_pct_to_close_races(oracle_alloc), 4),
+    )
+
+
+def _bootstrap_ci(
+    dems: pd.DataFrame,
+    score_col: str,
+    n: int,
+    reps: int,
+    seed: int,
+) -> tuple[float, float]:
+    """95% percentile bootstrap CI on `score_col` -> top-N -> close-race metric."""
+    rng = np.random.default_rng(seed)
+    samples = np.empty(reps, dtype=float)
+    for i in range(reps):
+        boot = dems.sample(n=len(dems), replace=True, random_state=rng.integers(1, 10**9))
+        alloc = allocate(boot, score_col=score_col, n=n)
+        samples[i] = metric_pct_to_close_races(alloc)
+    return (
+        round(float(np.percentile(samples, 2.5)), 4),
+        round(float(np.percentile(samples, 97.5)), 4),
+    )
+
+
 def run_backtest(
     *,
     feature_set: str,
@@ -71,7 +163,11 @@ def run_backtest(
     train_cycles: tuple[int, ...],
     test_cycle: int,
     processed_dir: Path,
-    n: int = 10,
+    universe: UniverseChoice = "all",
+    headline_n: int = HEADLINE_N,
+    n_grid: tuple[int, ...] = N_GRID,
+    bootstrap_reps: int = BOOTSTRAP_REPS,
+    bootstrap_seed: int = BOOTSTRAP_SEED,
     notes: str = "",
 ) -> BacktestRow:
     """Fit on `train_cycles`, score `test_cycle`, return a BacktestRow.
@@ -83,6 +179,8 @@ def run_backtest(
         raise NotImplementedError(
             f"feature_set={feature_set!r} not implemented yet. Phase 4 will add the rest."
         )
+    if headline_n not in n_grid:
+        raise ValueError(f"headline_n={headline_n} must be in n_grid={n_grid}")
 
     train_df = pd.concat(
         [load_processed(c, snapshot, processed_dir) for c in train_cycles],
@@ -92,42 +190,27 @@ def run_backtest(
 
     model = NaiveCompetitiveness(feature_set_name=feature_set).fit(train_df)
     scored = model.score(test_df)
-
-    # Restrict universe to Dem candidates in Wikipedia-tracked races. All three
-    # reference lines (model / fundraising / oracle) run on the *same* universe
-    # so the comparison is apples-to-apples. Oath wouldn't recommend a Solid-X
-    # race anyway, so Wikipedia coverage = the donor-relevant universe.
-    dems = scored.loc[
-        (scored["party_major"] == "D") & scored["cook_rating"].notna()
-    ].copy()
+    dems = _filter_universe(scored, universe)
+    dems[ORACLE_COL] = (dems["margin_pct"].abs() < 0.05).astype(float)
     n_dem = len(dems)
 
-    # --- Three reference lines, all using the same allocation function ---
+    metrics = tuple(_scores_at_n(dems, n) for n in n_grid)
 
-    # 1. Model: score by competitiveness output
-    model_alloc = allocate(dems, score_col=SCORE_COL, n=n)
-    model_metric = metric_pct_to_close_races(model_alloc)
-
-    # 2. Fundraising baseline: score by snapshot fundraising
-    fund_alloc = allocate(dems, score_col="total_trans", n=n)
-    fund_metric = metric_pct_to_close_races(fund_alloc)
-
-    # 3. Hindsight oracle: score = 1 if race finished <5%, else 0
-    dems = dems.copy()
-    dems["__oracle_score__"] = (dems["margin_pct"].abs() < 0.05).astype(float)
-    oracle_alloc = allocate(dems, score_col="__oracle_score__", n=n)
-    oracle_metric = metric_pct_to_close_races(oracle_alloc)
+    model_ci = _bootstrap_ci(dems, SCORE_COL, headline_n, bootstrap_reps, bootstrap_seed)
+    fund_ci = _bootstrap_ci(dems, FUND_COL, headline_n, bootstrap_reps, bootstrap_seed)
 
     return BacktestRow(
         feature_set=feature_set,
         snapshot=snapshot,
         test_cycle=test_cycle,
         train_cycles=tuple(train_cycles),
-        n=n,
+        universe=universe,
         n_dem_candidates=n_dem,
-        model_score=round(model_metric, 4),
-        fundraising_score=round(fund_metric, 4),
-        oracle_score=round(oracle_metric, 4),
+        metrics=metrics,
+        headline_n=headline_n,
+        headline_model_ci=model_ci,
+        headline_fund_ci=fund_ci,
+        bootstrap_reps=bootstrap_reps,
         notes=notes,
         timestamp=datetime.now(timezone.utc).isoformat(timespec="seconds"),
     )
@@ -141,16 +224,31 @@ def append_jsonl(row: BacktestRow, out_path: Path) -> None:
 
 
 def format_row(row: BacktestRow) -> str:
-    delta = row.model_score - row.fundraising_score
-    sign = "+" if delta >= 0 else ""
-    return (
+    """Pretty-print a row including N sweep + headline CI."""
+    lines = [
         f"[backtest] feature_set={row.feature_set} snapshot={row.snapshot} "
-        f"test={row.test_cycle} train={list(row.train_cycles)}\n"
-        f"  model_score:        {row.model_score:.4f}  (top-{row.n} of {row.n_dem_candidates} Dems)\n"
-        f"  fundraising_score:  {row.fundraising_score:.4f}\n"
-        f"  oracle_score:       {row.oracle_score:.4f}\n"
-        f"  Δ vs baseline:      {sign}{delta:.4f}"
+        f"test={row.test_cycle} train={list(row.train_cycles)} universe={row.universe}",
+        f"  universe size: {row.n_dem_candidates} Dems",
+        f"  {'N':>4} {'model':>8} {'fund':>8} {'oracle':>8} {'Δ':>8}",
+    ]
+    for m in row.metrics:
+        delta = m.model_score - m.fundraising_score
+        sign = "+" if delta >= 0 else ""
+        lines.append(
+            f"  {m.n:>4} {m.model_score:>8.4f} {m.fundraising_score:>8.4f} "
+            f"{m.oracle_score:>8.4f} {sign}{delta:>7.4f}"
+        )
+    head = row.headline
+    head_delta = head.model_score - head.fundraising_score
+    head_sign = "+" if head_delta >= 0 else ""
+    lines.append(
+        f"  headline (N={row.headline_n}): "
+        f"model {head.model_score:.4f} (95% CI [{row.headline_model_ci[0]:.4f}, "
+        f"{row.headline_model_ci[1]:.4f}]) vs fund {head.fundraising_score:.4f} "
+        f"(95% CI [{row.headline_fund_ci[0]:.4f}, {row.headline_fund_ci[1]:.4f}]) "
+        f"→ Δ {head_sign}{head_delta:.4f}"
     )
+    return "\n".join(lines)
 
 
 # ----- CLI -----
@@ -160,9 +258,7 @@ def _parse_cycles(s: Iterable[str]) -> tuple[int, ...]:
     for x in s:
         c = int(x)
         if c not in CYCLES:
-            raise argparse.ArgumentTypeError(
-                f"cycle {c} not in {list(CYCLES)}"
-            )
+            raise argparse.ArgumentTypeError(f"cycle {c} not in {list(CYCLES)}")
         out.append(c)
     return tuple(out)
 
@@ -178,15 +274,21 @@ def main() -> None:
                         help="training cycles (e.g. 2022 or 2014 2016 2022)")
     parser.add_argument("--test", type=int, required=True,
                         help="held-out test cycle")
-    parser.add_argument("--n", type=int, default=10, help="top-N for allocation")
+    parser.add_argument("--universe", choices=("all", "wikipedia"), default="all",
+                        help="candidate universe; default 'all' (Dems in any "
+                             "contested two-party general); 'wikipedia' "
+                             "restricts to Dems in Wikipedia-tracked races")
+    parser.add_argument("--headline-n", type=int, default=HEADLINE_N,
+                        help=f"top-N for the headline number; default {HEADLINE_N}")
+    parser.add_argument("--bootstrap-reps", type=int, default=BOOTSTRAP_REPS,
+                        help=f"bootstrap resamples for CI; default {BOOTSTRAP_REPS}")
     parser.add_argument("--processed-dir", type=Path, default=Path("data/processed"))
     parser.add_argument("--out", type=Path,
                         default=Path("data/processed/backtest_results.jsonl"))
     parser.add_argument("--notes", default="")
     args = parser.parse_args()
 
-    # Validate feature set name (helpful error before we get into the model)
-    get_feature_set(args.features)
+    get_feature_set(args.features)  # validate name early
 
     train_cycles = _parse_cycles(args.train)
     if args.test not in CYCLES:
@@ -199,7 +301,9 @@ def main() -> None:
             train_cycles=train_cycles,
             test_cycle=args.test,
             processed_dir=args.processed_dir,
-            n=args.n,
+            universe=args.universe,
+            headline_n=args.headline_n,
+            bootstrap_reps=args.bootstrap_reps,
             notes=args.notes,
         )
         print(format_row(row))

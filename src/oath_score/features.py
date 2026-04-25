@@ -195,7 +195,15 @@ def _attach_fec(df: pd.DataFrame, fec_df: pd.DataFrame) -> pd.DataFrame:
 
 
 def _fuzzy_fill_fec(merged: pd.DataFrame, fec_h: pd.DataFrame, missing_mask: pd.Series) -> pd.DataFrame:
-    """For rows without an exact FEC match, try fuzzy last-name match within district."""
+    """For rows without an exact FEC match, try fuzzy + substring within district.
+
+    Three passes for the unmatched rows:
+      1. difflib close-match at cutoff 0.85 (handles minor spelling variants)
+      2. substring containment in either direction (handles compound surnames
+         like "GLUESENKAMP PEREZ" vs "PEREZ" — MIT takes the trailing token,
+         FEC keeps the full pre-comma string)
+      3. give up
+    """
     from difflib import get_close_matches
 
     fec_by_district = fec_h.groupby(["state_abbr", "district"])
@@ -205,11 +213,36 @@ def _fuzzy_fill_fec(merged: pd.DataFrame, fec_h: pd.DataFrame, missing_mask: pd.
         if key not in fec_by_district.groups:
             return {}
         candidates = fec_h.loc[fec_by_district.groups[key]]
-        names = candidates["last_name"].tolist()
-        match = get_close_matches(row["last_name"], names, n=1, cutoff=0.85)
-        if not match:
+        if candidates.empty:
             return {}
-        rec = candidates.loc[candidates["last_name"] == match[0]].iloc[0]
+        # Restrict to FEC candidates of the same major party where possible —
+        # avoids cross-party false matches when names are similar.
+        same_party = candidates
+        if "party" in candidates.columns and row.get("party_major") in {"D", "R"}:
+            party_filter = {"D": ["DEM"], "R": ["REP"]}[row["party_major"]]
+            party_match = candidates[candidates["party"].isin(party_filter)]
+            if not party_match.empty:
+                same_party = party_match
+
+        names = same_party["last_name"].tolist()
+        target = str(row["last_name"]).strip().upper()
+
+        # Pass 1: difflib close-match
+        match = get_close_matches(target, names, n=1, cutoff=0.85)
+        if match:
+            rec = same_party.loc[same_party["last_name"] == match[0]].iloc[0]
+        else:
+            # Pass 2: substring containment in either direction
+            substring_hits = [
+                n for n in names
+                if n and target and (target in n or n in target)
+            ]
+            if not substring_hits:
+                return {}
+            # Prefer the shortest substring hit (most specific match)
+            best = min(substring_hits, key=len)
+            rec = same_party.loc[same_party["last_name"] == best].iloc[0]
+
         return {
             "cand_id": rec["cand_id"],
             "total_trans": rec["total_trans"],

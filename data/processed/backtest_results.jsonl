@@ -1,0 +1,1 @@
+{"feature_set": "naive", "snapshot": "T-60", "test_cycle": 2024, "train_cycles": [2022], "n": 10, "n_dem_candidates": 86, "model_score": 0.8, "fundraising_score": 0.6684, "oracle_score": 1.0, "notes": "", "timestamp": "2026-04-25T20:08:55+00:00"}

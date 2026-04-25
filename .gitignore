@@ -26,8 +26,12 @@ api_keys.py
 
 # Data (large; not committed)
 data/raw/
-data/processed/
+data/processed/*
 *.parquet
+
+# ...except the small backtest results log, which IS the improvement curve
+!data/processed/backtest_results.jsonl
+!data/processed/.gitkeep
 
 # Streamlit
 .streamlit/secrets.toml

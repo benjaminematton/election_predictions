@@ -23,3 +23,21 @@ api_keys.py
 # Editors
 .vscode/
 .idea/
+
+# Data (large; not committed)
+data/raw/
+data/processed/
+*.parquet
+
+# Streamlit
+.streamlit/secrets.toml
+
+# Test/coverage
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Notebook scratch
+.ipynb_checkpoints/

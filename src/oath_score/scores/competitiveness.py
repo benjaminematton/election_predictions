@@ -1,15 +1,23 @@
-"""Per-Dem-candidate competitiveness score.
+"""Competitiveness models for the improvement curve.
 
-Phase 3 ("naive baseline") version: logistic regression on cook_rating +
-incumbent. Target = "this Dem candidate won AND |margin_pct| < 5%".
+Two model classes share the same fit/predict_proba/score interface:
 
-Includes Cook-rating imputation for non-competitive districts (Wikipedia
-ratings table only covers ~94 races/cycle; the other ~230 contested
-districts have NaN cook_rating).
+  * ``LogisticCompetitiveness`` — logistic regression on a feature_set.
+    Targets ``|margin_pct| < 0.05`` (per-race close-race indicator).
+    Used for the first improvement curve.
 
-Future versions (Phase 4) swap the model for multi-quantile regression on
-signed margin and add the broader feature set via feature_sets.py. The
-public interface (.fit / .predict_proba / SCORE_COL) stays stable.
+  * ``MultiQuantileCompetitiveness`` (separate module) — fits 9 quantile
+    regressors on signed margin and derives close-race probability from
+    the empirical CDF. Used for the second improvement curve.
+
+Universe handling:
+  * For the ``naive`` set (cook + incumbent only), score 0 if cook_rating is
+    NaN — the model can't say anything useful without it.
+  * For richer sets that include cpvi, demographics, fundraising, etc.,
+    impute NaN cook from PVI sign (target-free) and score every Dem.
+
+The cook-distance-from-Tossup transform is naive-only — richer feature sets
+have enough capacity to learn the U-shape from interactions.
 """
 
 from __future__ import annotations
@@ -20,30 +28,30 @@ from typing import Iterable
 import numpy as np
 import pandas as pd
 from sklearn.linear_model import LogisticRegression
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler
 
 from oath_score.feature_sets import get as get_feature_set
+from oath_score.scores._imputation import (
+    fill_remaining_with_tossup,
+    impute_cook_from_pvi,
+)
 
 SCORE_COL = "score_competitiveness"
-TARGET_COL = "_target_close_d_win"
+TARGET_COL = "_target_close_race"
+
+# Feature sets where we should NOT use the cook-distance transform — the
+# extra features give the model enough capacity to learn cook_rating's
+# U-shape directly via interactions.
+_NAIVE_ONLY_SETS = frozenset({"naive"})
 
 
 def impute_cook_rating(df: pd.DataFrame) -> pd.Series:
-    """Fill NaN cook_rating from incumbent / past margin.
+    """LEGACY (Phase 3) imputation that uses the test-cycle margin.
 
-    Rule (per phase3.md, decision #1):
-      * If `incumbent == 1`, use Solid for the incumbent's party:
-          - D incumbent → 7.0
-          - R incumbent → 1.0
-      * Otherwise, infer Solid/Likely from the actual margin sign:
-          - margin >  0.10 → 7.0  (Solid D)
-          -  0.00 < margin < 0.10 → 6.0  (Likely D)
-          - -0.10 < margin < 0.00 → 2.0  (Likely R)
-          - margin < -0.10 → 1.0  (Solid R)
-
-    NOTE: imputing from test-cycle margin technically peeks at the target.
-    Mitigated because we ONLY impute the non-competitive districts (Wikipedia
-    didn't bother tracking them — the outcome is essentially deterministic).
-    Phase 4 will swap to PVI-based imputation once Daily Kos is restored.
+    Kept for the regression test that asserts it works as documented; not
+    used by any current model. Phase 4 models call ``impute_cook_from_pvi``
+    instead, which doesn't leak the target.
     """
     out = df["cook_rating"].copy().astype(float)
     needs_impute = out.isna()
@@ -54,38 +62,29 @@ def impute_cook_rating(df: pd.DataFrame) -> pd.Series:
     incumbent = df["incumbent"].fillna(0).astype(int)
     margin = pd.to_numeric(df["margin_pct"], errors="coerce")
 
-    # Incumbent fallback
     inc_d = needs_impute & (incumbent == 1) & (party_major == "D")
     inc_r = needs_impute & (incumbent == 1) & (party_major == "R")
     out.loc[inc_d] = 7.0
     out.loc[inc_r] = 1.0
 
-    # Open-seat fallback by margin sign / magnitude
     open_seat = needs_impute & (incumbent == 0)
     out.loc[open_seat & (margin > 0.10)] = 7.0
     out.loc[open_seat & (margin > 0.0) & (margin <= 0.10)] = 6.0
     out.loc[open_seat & (margin < 0.0) & (margin >= -0.10)] = 2.0
     out.loc[open_seat & (margin < -0.10)] = 1.0
 
-    # Anything still NaN (no margin data) → toss-up midpoint
-    out = out.fillna(4.0)
-    return out
+    return out.fillna(4.0)
 
 
 @dataclass
-class NaiveCompetitiveness:
-    """Phase 3 baseline: logistic regression on (cook_rating, incumbent).
+class LogisticCompetitiveness:
+    """Logistic regression on any feature_set, target = ``|margin| < 0.05``.
 
-    Targets `|margin_pct| < 0.05` — i.e., 'this race finished within 5%'.
-    That's a per-race quantity (the v3 plan's `P(margin<5%)`), shared by both
-    candidates in the race. The score for each Dem candidate is then 'how
-    likely is this race to be close.'
-
-    Why not 'close-D-win'? Logistic regression with one ordinal feature is
-    monotonic. close-D-win actually peaks at cook=4-5 and falls off at cook=7
-    (Solid D districts mostly produce blowouts, not close wins) — a non-
-    monotonic shape the model can't fit. The 'close race' target is closer to
-    monotonic in cook_rating and gives the model a signal it can actually use.
+    Args:
+        feature_set_name: matches a key in ``feature_sets.REGISTRY``.
+        C: inverse regularization strength (sklearn default 1.0).
+        class_weight: pass through to sklearn; default None (the close-race
+            target is balanced enough that weighting hurts more than helps).
     """
 
     feature_set_name: str = "naive"
@@ -96,34 +95,18 @@ class NaiveCompetitiveness:
         self._model: LogisticRegression | None = None
         self._feature_cols: tuple[str, ...] = get_feature_set(self.feature_set_name).columns
 
+    @property
+    def is_naive(self) -> bool:
+        return self.feature_set_name in _NAIVE_ONLY_SETS
+
     # ----- training -----
 
-    def fit(self, train_df: pd.DataFrame) -> "NaiveCompetitiveness":
-        """Fit on Dem candidates whose race is in the Wikipedia ratings table.
-
-        Why we filter to non-NaN cook_rating instead of imputing:
-          The earlier impute_cook_rating helper used the candidate's *margin*
-          to backfill missing cook ratings. That leaks the target into the
-          training feature, and at test time it leaks the test-cycle outcome
-          into the score. Restricting to Wikipedia-tracked races (the only
-          ones a competitive donor actually agonizes over) avoids the leak
-          entirely. impute_cook_rating remains in this file for Phase 4 when
-          we restore Daily Kos PVI as a target-free imputation source.
-
-        Why we transform cook_rating to distance-from-Tossup:
-          Close-race rate peaks at cook=3–5 (Tossup territory) and falls off
-          at cook=1 or 7 (Solid R/D landslides). Logistic on the raw ordinal
-          can only fit a monotonic slope and ends up ranking Solid-D blowouts
-          above Tossups. -abs(cook_rating - 4) collapses the U-shape onto a
-          monotonic axis the model can use.
-        """
-        d = train_df.loc[
-            (train_df["party_major"] == "D") & train_df["cook_rating"].notna()
-        ].copy()
+    def fit(self, train_df: pd.DataFrame) -> "LogisticCompetitiveness":
+        """Fit on Dem candidates from the training cycles."""
+        d = self._scorable_dems(train_df).copy()
         if d.empty:
             raise ValueError(
-                "No Democratic candidates with cook_rating in training frame "
-                "(Wikipedia ratings table empty for this cycle?)"
+                f"No scorable Democratic candidates for feature_set={self.feature_set_name!r}"
             )
 
         X = self._featurize(d)
@@ -135,56 +118,39 @@ class NaiveCompetitiveness:
                 "model would not learn anything useful."
             )
 
-        self._model = LogisticRegression(
-            C=self.C,
-            class_weight=self.class_weight,
-            max_iter=1000,
-            solver="lbfgs",
-        )
+        # StandardScaler is essential when richer feature sets mix scales —
+        # ACS median_income (~60k), self_raised_log (~14), incumbent (0/1).
+        # Without it L2-regularized logistic puts almost all the weight on
+        # the large-magnitude features regardless of signal.
+        self._model = Pipeline([
+            ("scale", StandardScaler()),
+            ("logreg", LogisticRegression(
+                C=self.C,
+                class_weight=self.class_weight,
+                max_iter=2000,
+                solver="lbfgs",
+            )),
+        ])
         self._model.fit(X, y)
         return self
 
     # ----- prediction -----
 
     def predict_proba(self, df: pd.DataFrame) -> pd.Series:
-        """Score every row of df. Score 0 for non-Dems and for Dems whose
-        race isn't in the Wikipedia ratings table (Oath doesn't recommend
-        races a competitive-donor wouldn't be agonizing over).
-        """
+        """Score every row of df. Score 0 for non-Dems and rows we can't featurize."""
         if self._model is None:
             raise RuntimeError("call .fit() first")
 
-        scorable = (df["party_major"] == "D") & df["cook_rating"].notna()
+        scorable_mask = self._scorable_mask(df)
         out = pd.Series(0.0, index=df.index, name=SCORE_COL)
-        if not scorable.any():
+        if not scorable_mask.any():
             return out
 
-        d = df.loc[scorable].copy()
+        d = df.loc[scorable_mask].copy()
         X = self._featurize(d)
         proba = self._model.predict_proba(X)[:, 1]
-        out.loc[scorable] = proba
+        out.loc[scorable_mask] = proba
         return out
-
-    def _featurize(self, d: pd.DataFrame) -> np.ndarray:
-        """Transform raw feature columns into the design matrix.
-
-        Currently transforms cook_rating to its distance from Tossup (cook=4)
-        so logistic regression can capture the U-shaped close-race signal.
-        Other naive features pass through untouched.
-        """
-        cols = list(self._feature_cols)
-        X = d[cols].astype(float).copy()
-        if "cook_rating" in X.columns:
-            X["cook_rating"] = -(X["cook_rating"] - 4.0).abs()
-        return X.to_numpy()
-
-    @property
-    def transformed_feature_names(self) -> tuple[str, ...]:
-        """Names of the columns the model actually saw, after _featurize."""
-        return tuple(
-            "cook_distance_from_tossup_neg" if c == "cook_rating" else c
-            for c in self._feature_cols
-        )
 
     def score(self, df: pd.DataFrame) -> pd.DataFrame:
         """Convenience: attach SCORE_COL to a copy of df."""
@@ -192,7 +158,62 @@ class NaiveCompetitiveness:
         out[SCORE_COL] = self.predict_proba(df)
         return out
 
-    # ----- inspection -----
+    # ----- universe + featurize -----
+
+    def _scorable_mask(self, df: pd.DataFrame) -> pd.Series:
+        """Boolean mask of rows the model can score.
+
+        For the naive set (cook + incumbent), require non-NaN cook_rating
+        — without ratings the model has no signal. For richer sets, rely on
+        PVI-based imputation in _featurize and score every Dem.
+        """
+        is_dem = df["party_major"] == "D"
+        if self.is_naive:
+            return is_dem & df["cook_rating"].notna()
+        return is_dem
+
+    def _scorable_dems(self, df: pd.DataFrame) -> pd.DataFrame:
+        return df.loc[self._scorable_mask(df)]
+
+    def _featurize(self, d: pd.DataFrame) -> np.ndarray:
+        """Transform raw feature columns into the design matrix.
+
+        For naive set: apply cook-distance-from-Tossup transform to get the
+        U-shape onto a monotonic axis logistic can fit.
+
+        For richer sets: PVI-impute NaN cook_rating, then pass features
+        through. Numeric NaNs in any feature column → 0 (median-ish for
+        scaled features; logistic is robust to this).
+        """
+        cols = list(self._feature_cols)
+        X = d[cols].astype(float).copy()
+
+        if "cook_rating" in X.columns:
+            if self.is_naive:
+                X["cook_rating"] = -(X["cook_rating"] - 4.0).abs()
+            else:
+                # Target-free PVI imputation, then any leftover NaNs to Tossup
+                imputed = impute_cook_from_pvi(d)
+                X["cook_rating"] = fill_remaining_with_tossup(imputed).astype(float).values
+
+        # Any remaining NaNs in other columns: median imputation done lazily
+        # via fillna(0). For demographics and fundraising features this is
+        # crude but safe given everything is log-scaled or proportions.
+        X = X.fillna(0.0)
+        return X.to_numpy()
+
+    @property
+    def transformed_feature_names(self) -> tuple[str, ...]:
+        """Names of the columns the model actually saw, after _featurize."""
+        if self.is_naive:
+            return tuple(
+                "cook_distance_from_tossup_neg" if c == "cook_rating" else c
+                for c in self._feature_cols
+            )
+        return tuple(
+            "cook_rating_imputed" if c == "cook_rating" else c
+            for c in self._feature_cols
+        )
 
     @property
     def feature_columns(self) -> tuple[str, ...]:
@@ -200,12 +221,19 @@ class NaiveCompetitiveness:
 
     @property
     def coef_(self) -> dict[str, float]:
-        """Coefficients keyed by the *transformed* feature names the model saw.
+        """Standardized coefficients keyed by transformed feature names.
 
-        Specifically, `cook_rating` becomes `cook_distance_from_tossup_neg`
-        so consumers don't get misled into thinking +1.0 means 'higher cook
-        ordinal → higher score' when it actually means 'closer to Tossup → higher score'.
+        Because we wrap LogisticRegression in a StandardScaler pipeline, these
+        are coefficients on z-scored features — comparable across columns by
+        magnitude. Original-scale coefficients aren't recovered (would need
+        the per-feature mean/std from the scaler step).
         """
         if self._model is None:
             return {}
-        return dict(zip(self.transformed_feature_names, self._model.coef_[0]))
+        # _model is now a Pipeline; the LogisticRegression step is named "logreg"
+        coef = self._model.named_steps["logreg"].coef_[0]
+        return dict(zip(self.transformed_feature_names, coef))
+
+
+# Backwards-compat alias for one commit window. To be removed after Phase 4.
+NaiveCompetitiveness = LogisticCompetitiveness

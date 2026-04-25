@@ -36,8 +36,9 @@ import pandas as pd
 
 from oath_score.allocation import allocate, metric_pct_to_close_races
 from oath_score.constants import CYCLES, SNAPSHOT_OFFSETS_DAYS
+from oath_score.feature_sets import REGISTRY as FEATURE_REGISTRY
 from oath_score.feature_sets import get as get_feature_set
-from oath_score.scores.competitiveness import NaiveCompetitiveness, SCORE_COL
+from oath_score.scores.competitiveness import LogisticCompetitiveness, SCORE_COL
 
 
 # Range of top-N values to sweep per backtest row.
@@ -50,6 +51,18 @@ ORACLE_COL = "__oracle_score__"
 FUND_COL = "total_trans"
 
 UniverseChoice = str  # "all" | "wikipedia"
+ModelChoice = str      # "logistic" | "multi-quantile"
+
+
+def _build_model(model: ModelChoice, feature_set: str):
+    """Dispatch on model name. Imports the multi-quantile model lazily so
+    Phase 4.3 (logistic curve) can run before Phase 4.4 lands."""
+    if model == "logistic":
+        return LogisticCompetitiveness(feature_set_name=feature_set)
+    if model == "multi-quantile":
+        from oath_score.scores.multi_quantile import MultiQuantileCompetitiveness
+        return MultiQuantileCompetitiveness(feature_set_name=feature_set)
+    raise ValueError(f"unknown model={model!r}; want 'logistic' or 'multi-quantile'")
 
 
 # ----- result row -----
@@ -65,6 +78,7 @@ class NMetric:
 @dataclass(frozen=True)
 class BacktestRow:
     feature_set: str
+    model: str                                # "logistic" | "multi-quantile"
     snapshot: str
     test_cycle: int
     train_cycles: tuple[int, ...]
@@ -81,6 +95,7 @@ class BacktestRow:
     def as_dict(self) -> dict:
         return {
             "feature_set": self.feature_set,
+            "model": self.model,
             "snapshot": self.snapshot,
             "test_cycle": self.test_cycle,
             "train_cycles": list(self.train_cycles),
@@ -113,12 +128,21 @@ def load_processed(cycle: int, snapshot: str, processed_dir: Path) -> pd.DataFra
     return pd.read_parquet(path)
 
 
-def _filter_universe(df: pd.DataFrame, universe: UniverseChoice) -> pd.DataFrame:
-    """Apply the universe filter to scored Dem candidates."""
+def _filter_universe(df: pd.DataFrame, universe: UniverseChoice, *, naive: bool) -> pd.DataFrame:
+    """Apply the universe filter to scored Dem candidates.
+
+    For the naive feature set, "all" still requires non-NaN cook_rating —
+    the model can't say anything useful otherwise (and would just emit 0).
+    For richer feature sets, "all" means the full Dem contested-race
+    universe; the model imputes cook from PVI internally.
+    """
     dems = df.loc[df["party_major"] == "D"].copy()
     if universe == "wikipedia":
         dems = dems.loc[dems["cook_rating"].notna()].copy()
-    elif universe != "all":
+    elif universe == "all":
+        if naive:
+            dems = dems.loc[dems["cook_rating"].notna()].copy()
+    else:
         raise ValueError(f"unknown universe={universe!r}; want 'all' or 'wikipedia'")
     return dems
 
@@ -163,6 +187,7 @@ def run_backtest(
     train_cycles: tuple[int, ...],
     test_cycle: int,
     processed_dir: Path,
+    model: ModelChoice = "logistic",
     universe: UniverseChoice = "all",
     headline_n: int = HEADLINE_N,
     n_grid: tuple[int, ...] = N_GRID,
@@ -170,14 +195,10 @@ def run_backtest(
     bootstrap_seed: int = BOOTSTRAP_SEED,
     notes: str = "",
 ) -> BacktestRow:
-    """Fit on `train_cycles`, score `test_cycle`, return a BacktestRow.
-
-    Currently only the `naive` feature_set is wired up — Phase 4 will register
-    additional models in feature_sets.py and dispatch here.
-    """
-    if feature_set != "naive":
-        raise NotImplementedError(
-            f"feature_set={feature_set!r} not implemented yet. Phase 4 will add the rest."
+    """Fit on `train_cycles`, score `test_cycle`, return a BacktestRow."""
+    if feature_set not in FEATURE_REGISTRY:
+        raise KeyError(
+            f"unknown feature_set={feature_set!r}; have {sorted(FEATURE_REGISTRY)}"
         )
     if headline_n not in n_grid:
         raise ValueError(f"headline_n={headline_n} must be in n_grid={n_grid}")
@@ -188,9 +209,10 @@ def run_backtest(
     )
     test_df = load_processed(test_cycle, snapshot, processed_dir)
 
-    model = NaiveCompetitiveness(feature_set_name=feature_set).fit(train_df)
-    scored = model.score(test_df)
-    dems = _filter_universe(scored, universe)
+    fitted = _build_model(model, feature_set).fit(train_df)
+    scored = fitted.score(test_df)
+    naive = (feature_set == "naive")
+    dems = _filter_universe(scored, universe, naive=naive)
     dems[ORACLE_COL] = (dems["margin_pct"].abs() < 0.05).astype(float)
     n_dem = len(dems)
 
@@ -201,6 +223,7 @@ def run_backtest(
 
     return BacktestRow(
         feature_set=feature_set,
+        model=model,
         snapshot=snapshot,
         test_cycle=test_cycle,
         train_cycles=tuple(train_cycles),
@@ -226,7 +249,8 @@ def append_jsonl(row: BacktestRow, out_path: Path) -> None:
 def format_row(row: BacktestRow) -> str:
     """Pretty-print a row including N sweep + headline CI."""
     lines = [
-        f"[backtest] feature_set={row.feature_set} snapshot={row.snapshot} "
+        f"[backtest] feature_set={row.feature_set} model={row.model} "
+        f"snapshot={row.snapshot} "
         f"test={row.test_cycle} train={list(row.train_cycles)} universe={row.universe}",
         f"  universe size: {row.n_dem_candidates} Dems",
         f"  {'N':>4} {'model':>8} {'fund':>8} {'oracle':>8} {'Δ':>8}",
@@ -267,6 +291,9 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Run one backtest row.")
     parser.add_argument("--features", required=True,
                         help="feature-set name from feature_sets.REGISTRY")
+    parser.add_argument("--model", choices=("logistic", "multi-quantile"),
+                        default="logistic",
+                        help="competitiveness model class; default 'logistic'")
     parser.add_argument("--snapshots", nargs="+", required=True,
                         choices=list(SNAPSHOT_OFFSETS_DAYS),
                         help="one or more snapshots (T-110, T-60, T-20)")
@@ -297,6 +324,7 @@ def main() -> None:
     for snap in args.snapshots:
         row = run_backtest(
             feature_set=args.features,
+            model=args.model,
             snapshot=snap,
             train_cycles=train_cycles,
             test_cycle=args.test,

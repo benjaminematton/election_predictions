@@ -136,7 +136,7 @@ class TestNaiveCompetitiveness:
         train = pd.DataFrame([
             {"party_major": "R", "cook_rating": 1.0, "incumbent": 1, "margin_pct": -0.3},
         ])
-        with pytest.raises(ValueError, match="No Democratic"):
+        with pytest.raises(ValueError, match="No scorable Democratic"):
             NaiveCompetitiveness().fit(train)
 
     def test_too_few_positives_raises(self):

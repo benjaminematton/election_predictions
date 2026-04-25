@@ -62,6 +62,7 @@ def _make_row(**overrides) -> BacktestRow:
     """Helper: build a BacktestRow with sensible defaults for tests that don't care."""
     defaults = dict(
         feature_set="naive",
+        model="logistic",
         snapshot="T-60",
         test_cycle=2024,
         train_cycles=(2022,),
@@ -141,9 +142,9 @@ class TestRunBacktest:
         assert row_all.n_dem_candidates >= row_wiki.n_dem_candidates
 
     def test_unknown_feature_set_raises(self, synthetic_dir):
-        with pytest.raises(NotImplementedError):
+        with pytest.raises(KeyError):
             run_backtest(
-                feature_set="full",
+                feature_set="not-a-real-set",
                 snapshot="T-60",
                 train_cycles=(2022,),
                 test_cycle=2024,

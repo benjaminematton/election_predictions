@@ -2,8 +2,7 @@
 
 ![Hero — splitter widget allocating $100 across the top-N 2024 House candidates](docs/hero.png)
 
-**[Live demo](https://share.streamlit.io)** · 217 tests passing · MIT license
-<!-- TODO: replace the share.streamlit.io link with the deployed URL once it's live. -->
+**[Live demo](https://electionpredictions-house-impact-score.streamlit.app)** (~30s cold start) · 217 tests passing · MIT license
 
 ## What this is
 

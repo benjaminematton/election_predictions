@@ -32,6 +32,10 @@ data/processed/*
 # ...except the small backtest results log, which IS the improvement curve
 !data/processed/backtest_results.jsonl
 !data/processed/.gitkeep
+# ...and the frozen Phase 7 calibration artifacts (regeneratable, but useful as
+# checked-in defaults for the deployed Streamlit app to read at startup).
+!data/processed/decile_thresholds.json
+!data/processed/phase7_summary.json
 
 # Streamlit
 .streamlit/secrets.toml

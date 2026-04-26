@@ -49,6 +49,10 @@ BOOTSTRAP_SEED: int = 42
 
 ORACLE_COL = "__oracle_score__"
 FUND_COL = "total_trans"
+COOK_FINAL_COL = "cook_rating_final"
+# T-7 days before election; closest Cook/Sabato/Inside ratings revision is the
+# "Cook-final benchmark" — the strong-expert reference line.
+COOK_FINAL_OFFSET_DAYS = 7
 
 UniverseChoice = str  # "all" | "wikipedia"
 ModelChoice = str      # "logistic" | "multi-quantile"
@@ -57,9 +61,9 @@ CombineChoice = str    # "competitiveness" | "base" | "impact"
 PIVOTAL_COL = "__is_pivotal__"
 UNDER_FLOOR_COL = "__is_under_floor__"
 
-# Hard-coded weight on the financial-need adjustment for Phase 6.
-# Phase 7 grid-searches this against the headline + secondary metrics.
-NEED_ALPHA: float = 0.3
+# Default weight on the financial-need adjustment. Phase 6 hard-coded 0.3;
+# Phase 7's calibration runs sweep this and pick a data-driven α*.
+DEFAULT_NEED_ALPHA: float = 0.3
 
 
 def _build_model(model: ModelChoice, feature_set: str):
@@ -81,6 +85,7 @@ class NMetric:
     model_score: float
     fundraising_score: float
     oracle_score: float
+    cook_final_score: float | None = None
 
 
 @dataclass(frozen=True)
@@ -97,10 +102,12 @@ class BacktestRow:
     headline_n: int                          # which N in metrics is the canonical one
     headline_model_ci: tuple[float, float]   # (low, high) at 95% confidence
     headline_fund_ci: tuple[float, float]
+    headline_cook_final_ci: tuple[float, float] | None  # only set when Cook-final ratings fetched
     pivotal_dollar_share: float | None       # secondary metric, None if combine=competitiveness
     pivotal_ci: tuple[float, float] | None
     floor_saturation_efficiency: float | None  # only set when combine=impact
     floor_saturation_ci: tuple[float, float] | None
+    need_alpha: float | None                  # set when combine=impact
     bootstrap_reps: int
     notes: str
     timestamp: str
@@ -119,6 +126,10 @@ class BacktestRow:
             "headline_n": self.headline_n,
             "headline_model_ci": list(self.headline_model_ci),
             "headline_fund_ci": list(self.headline_fund_ci),
+            "headline_cook_final_ci": (
+                list(self.headline_cook_final_ci)
+                if self.headline_cook_final_ci is not None else None
+            ),
             "pivotal_dollar_share": self.pivotal_dollar_share,
             "pivotal_ci": list(self.pivotal_ci) if self.pivotal_ci is not None else None,
             "floor_saturation_efficiency": self.floor_saturation_efficiency,
@@ -126,6 +137,7 @@ class BacktestRow:
                 list(self.floor_saturation_ci)
                 if self.floor_saturation_ci is not None else None
             ),
+            "need_alpha": self.need_alpha,
             "bootstrap_reps": self.bootstrap_reps,
             "notes": self.notes,
             "timestamp": self.timestamp,
@@ -149,6 +161,42 @@ def load_processed(cycle: int, snapshot: str, processed_dir: Path) -> pd.DataFra
     return pd.read_parquet(path)
 
 
+def _attach_cook_final(
+    dems: pd.DataFrame,
+    test_cycle: int,
+    raw_dir: Path,
+) -> pd.DataFrame:
+    """Fetch the T-7 Wikipedia ratings revision and join `cook_rating_final`.
+
+    Falls back to closest-before if the exact T-7 revision isn't available.
+    Districts not on the T-7 ratings table get NaN, which the allocator
+    treats as 0 (consistent with non-Wikipedia rows in the naive universe).
+    """
+    from datetime import timedelta
+    from oath_score.constants import GENERAL_ELECTION_DATES
+    from oath_score.ingest.ratings import fetch_ratings
+
+    election_date = GENERAL_ELECTION_DATES[test_cycle]
+    target_date = election_date - timedelta(days=COOK_FINAL_OFFSET_DAYS)
+
+    try:
+        ratings_result = fetch_ratings(test_cycle, target_date, raw_dir)
+    except Exception as exc:
+        # Don't fail the whole backtest if the T-7 fetch fails — just skip the
+        # benchmark (downstream code checks for COOK_FINAL_COL presence).
+        print(f"[backtest] Cook-final fetch failed for {test_cycle}: {exc}")
+        return dems
+
+    rdf = ratings_result.df
+    if "cook_ordinal" not in rdf.columns:
+        return dems
+
+    cook_table = rdf[["state_abbr", "district", "cook_ordinal"]].rename(
+        columns={"cook_ordinal": COOK_FINAL_COL}
+    )
+    return dems.merge(cook_table, on=["state_abbr", "district"], how="left")
+
+
 def _filter_universe(df: pd.DataFrame, universe: UniverseChoice, *, naive: bool) -> pd.DataFrame:
     """Apply the universe filter to scored Dem candidates.
 
@@ -169,15 +217,20 @@ def _filter_universe(df: pd.DataFrame, universe: UniverseChoice, *, naive: bool)
 
 
 def _scores_at_n(dems: pd.DataFrame, n: int) -> NMetric:
-    """Compute model / fund / oracle metrics at one N."""
+    """Compute model / fund / oracle / cook-final metrics at one N."""
     model_alloc = allocate(dems, score_col=SCORE_COL, n=n)
     fund_alloc = allocate(dems, score_col=FUND_COL, n=n)
     oracle_alloc = allocate(dems, score_col=ORACLE_COL, n=n)
+    cook_final = None
+    if COOK_FINAL_COL in dems.columns:
+        cook_alloc = allocate(dems, score_col=COOK_FINAL_COL, n=n)
+        cook_final = round(metric_pct_to_close_races(cook_alloc), 4)
     return NMetric(
         n=n,
         model_score=round(metric_pct_to_close_races(model_alloc), 4),
         fundraising_score=round(metric_pct_to_close_races(fund_alloc), 4),
         oracle_score=round(metric_pct_to_close_races(oracle_alloc), 4),
+        cook_final_score=cook_final,
     )
 
 
@@ -216,6 +269,7 @@ def run_backtest(
     n_grid: tuple[int, ...] = N_GRID,
     bootstrap_reps: int = BOOTSTRAP_REPS,
     bootstrap_seed: int = BOOTSTRAP_SEED,
+    need_alpha: float = DEFAULT_NEED_ALPHA,
     notes: str = "",
 ) -> BacktestRow:
     """Fit on `train_cycles`, score `test_cycle`, return a BacktestRow.
@@ -248,6 +302,7 @@ def run_backtest(
     naive = (feature_set == "naive")
     dems = _filter_universe(scored, universe, naive=naive)
     dems[ORACLE_COL] = (dems["margin_pct"].abs() < 0.05).astype(float)
+    dems = _attach_cook_final(dems, test_cycle, raw_dir)
     n_dem = len(dems)
 
     pivotal_share: float | None = None
@@ -262,8 +317,10 @@ def run_backtest(
         pivotal_share, pivotal_ci = _pivotal_metric_with_ci(
             dems, headline_n, bootstrap_reps, bootstrap_seed
         )
+    alpha_used: float | None = None
     if combine == "impact":
-        dems = _apply_need_combine(dems=dems, train_df=train_df)
+        dems = _apply_need_combine(dems=dems, train_df=train_df, need_alpha=need_alpha)
+        alpha_used = float(need_alpha)
         floor_saturation, floor_saturation_ci = _floor_saturation_with_ci(
             dems, headline_n, bootstrap_reps, bootstrap_seed
         )
@@ -272,6 +329,11 @@ def run_backtest(
 
     model_ci = _bootstrap_ci(dems, SCORE_COL, headline_n, bootstrap_reps, bootstrap_seed)
     fund_ci = _bootstrap_ci(dems, FUND_COL, headline_n, bootstrap_reps, bootstrap_seed)
+    cook_final_ci: tuple[float, float] | None = None
+    if COOK_FINAL_COL in dems.columns:
+        cook_final_ci = _bootstrap_ci(
+            dems, COOK_FINAL_COL, headline_n, bootstrap_reps, bootstrap_seed
+        )
 
     return BacktestRow(
         feature_set=feature_set,
@@ -286,10 +348,12 @@ def run_backtest(
         headline_n=headline_n,
         headline_model_ci=model_ci,
         headline_fund_ci=fund_ci,
+        headline_cook_final_ci=cook_final_ci,
         pivotal_dollar_share=pivotal_share,
         pivotal_ci=pivotal_ci,
         floor_saturation_efficiency=floor_saturation,
         floor_saturation_ci=floor_saturation_ci,
+        need_alpha=alpha_used,
         bootstrap_reps=bootstrap_reps,
         notes=notes,
         timestamp=datetime.now(timezone.utc).isoformat(timespec="seconds"),
@@ -344,7 +408,12 @@ def _apply_stakes_combine(
     return dems
 
 
-def _apply_need_combine(*, dems: pd.DataFrame, train_df: pd.DataFrame) -> pd.DataFrame:
+def _apply_need_combine(
+    *,
+    dems: pd.DataFrame,
+    train_df: pd.DataFrame,
+    need_alpha: float = DEFAULT_NEED_ALPHA,
+) -> pd.DataFrame:
     """Layer the financial-need adjustment on top of the existing base score.
 
     Expects `dems` to already contain SCORE_COL set to `base = sqrt(comp * stakes)`
@@ -367,7 +436,7 @@ def _apply_need_combine(*, dems: pd.DataFrame, train_df: pd.DataFrame) -> pd.Dat
     dems[UNDER_FLOOR_COL] = (own_spend.values < floor.values).astype(float)
 
     base = dems[SCORE_COL].clip(lower=0.0, upper=1.0).fillna(0.0)
-    dems[SCORE_COL] = (base * (1.0 + NEED_ALPHA * need_raw.values)).clip(lower=0.0, upper=1.0)
+    dems[SCORE_COL] = (base * (1.0 + need_alpha * need_raw.values)).clip(lower=0.0, upper=1.0)
     return dems
 
 
@@ -462,6 +531,15 @@ def format_row(row: BacktestRow) -> str:
         f"(95% CI [{row.headline_fund_ci[0]:.4f}, {row.headline_fund_ci[1]:.4f}]) "
         f"→ Δ {head_sign}{head_delta:.4f}"
     )
+    if head.cook_final_score is not None and row.headline_cook_final_ci is not None:
+        cook_delta = head.model_score - head.cook_final_score
+        cook_sign = "+" if cook_delta >= 0 else ""
+        lines.append(
+            f"  cook_final (N={row.headline_n}): {head.cook_final_score:.4f} "
+            f"(95% CI [{row.headline_cook_final_ci[0]:.4f}, "
+            f"{row.headline_cook_final_ci[1]:.4f}]) "
+            f"→ model − cook = {cook_sign}{cook_delta:.4f}"
+        )
     if row.pivotal_dollar_share is not None and row.pivotal_ci is not None:
         lines.append(
             f"  pivotal_dollar_share: {row.pivotal_dollar_share:.4f} "
@@ -516,6 +594,9 @@ def main() -> None:
                         help=f"top-N for the headline number; default {HEADLINE_N}")
     parser.add_argument("--bootstrap-reps", type=int, default=BOOTSTRAP_REPS,
                         help=f"bootstrap resamples for CI; default {BOOTSTRAP_REPS}")
+    parser.add_argument("--need-alpha", type=float, default=DEFAULT_NEED_ALPHA,
+                        help=f"financial-need weight α (only used with combine=impact); "
+                             f"default {DEFAULT_NEED_ALPHA}")
     parser.add_argument("--processed-dir", type=Path, default=Path("data/processed"))
     parser.add_argument("--out", type=Path,
                         default=Path("data/processed/backtest_results.jsonl"))
@@ -541,6 +622,7 @@ def main() -> None:
             universe=args.universe,
             headline_n=args.headline_n,
             bootstrap_reps=args.bootstrap_reps,
+            need_alpha=args.need_alpha,
             notes=args.notes,
         )
         print(format_row(row))

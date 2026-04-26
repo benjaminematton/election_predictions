@@ -52,9 +52,14 @@ FUND_COL = "total_trans"
 
 UniverseChoice = str  # "all" | "wikipedia"
 ModelChoice = str      # "logistic" | "multi-quantile"
-CombineChoice = str    # "competitiveness" | "base"
+CombineChoice = str    # "competitiveness" | "base" | "impact"
 
 PIVOTAL_COL = "__is_pivotal__"
+UNDER_FLOOR_COL = "__is_under_floor__"
+
+# Hard-coded weight on the financial-need adjustment for Phase 6.
+# Phase 7 grid-searches this against the headline + secondary metrics.
+NEED_ALPHA: float = 0.3
 
 
 def _build_model(model: ModelChoice, feature_set: str):
@@ -94,6 +99,8 @@ class BacktestRow:
     headline_fund_ci: tuple[float, float]
     pivotal_dollar_share: float | None       # secondary metric, None if combine=competitiveness
     pivotal_ci: tuple[float, float] | None
+    floor_saturation_efficiency: float | None  # only set when combine=impact
+    floor_saturation_ci: tuple[float, float] | None
     bootstrap_reps: int
     notes: str
     timestamp: str
@@ -114,6 +121,11 @@ class BacktestRow:
             "headline_fund_ci": list(self.headline_fund_ci),
             "pivotal_dollar_share": self.pivotal_dollar_share,
             "pivotal_ci": list(self.pivotal_ci) if self.pivotal_ci is not None else None,
+            "floor_saturation_efficiency": self.floor_saturation_efficiency,
+            "floor_saturation_ci": (
+                list(self.floor_saturation_ci)
+                if self.floor_saturation_ci is not None else None
+            ),
             "bootstrap_reps": self.bootstrap_reps,
             "notes": self.notes,
             "timestamp": self.timestamp,
@@ -219,9 +231,9 @@ def run_backtest(
         )
     if headline_n not in n_grid:
         raise ValueError(f"headline_n={headline_n} must be in n_grid={n_grid}")
-    if combine == "base" and model != "multi-quantile":
+    if combine in ("base", "impact") and model != "multi-quantile":
         raise ValueError(
-            "combine='base' requires model='multi-quantile' "
+            f"combine={combine!r} requires model='multi-quantile' "
             "(logistic doesn't expose the per-race predictive distribution)"
         )
 
@@ -240,12 +252,19 @@ def run_backtest(
 
     pivotal_share: float | None = None
     pivotal_ci: tuple[float, float] | None = None
-    if combine == "base":
+    floor_saturation: float | None = None
+    floor_saturation_ci: tuple[float, float] | None = None
+    if combine in ("base", "impact"):
         dems = _apply_stakes_combine(
             dems=dems, fitted_model=fitted, snapshot=snapshot,
             test_cycle=test_cycle, raw_dir=raw_dir,
         )
         pivotal_share, pivotal_ci = _pivotal_metric_with_ci(
+            dems, headline_n, bootstrap_reps, bootstrap_seed
+        )
+    if combine == "impact":
+        dems = _apply_need_combine(dems=dems, train_df=train_df)
+        floor_saturation, floor_saturation_ci = _floor_saturation_with_ci(
             dems, headline_n, bootstrap_reps, bootstrap_seed
         )
 
@@ -269,6 +288,8 @@ def run_backtest(
         headline_fund_ci=fund_ci,
         pivotal_dollar_share=pivotal_share,
         pivotal_ci=pivotal_ci,
+        floor_saturation_efficiency=floor_saturation,
+        floor_saturation_ci=floor_saturation_ci,
         bootstrap_reps=bootstrap_reps,
         notes=notes,
         timestamp=datetime.now(timezone.utc).isoformat(timespec="seconds"),
@@ -321,6 +342,62 @@ def _apply_stakes_combine(
         * stakes_norm.clip(lower=0.0, upper=1.0).fillna(0.0)
     )
     return dems
+
+
+def _apply_need_combine(*, dems: pd.DataFrame, train_df: pd.DataFrame) -> pd.DataFrame:
+    """Layer the financial-need adjustment on top of the existing base score.
+
+    Expects `dems` to already contain SCORE_COL set to `base = sqrt(comp * stakes)`
+    (i.e., `_apply_stakes_combine` has already run). Adds the need_raw column
+    and overwrites SCORE_COL with `clip(base * (1 + alpha * need_raw), 0, 1)`.
+
+    Trains FinancialNeed on `train_df` (close-race D winners only).
+    """
+    from oath_score.scores.financial_need import FinancialNeed, MIN_FLOOR
+
+    need_model = FinancialNeed().fit(train_df)
+    floor = need_model.predict_floor(dems)
+    need_raw = need_model.predict_need(dems)
+
+    own_spend = pd.to_numeric(dems["total_trans"], errors="coerce").fillna(0.0).clip(lower=0.0)
+
+    dems = dems.copy()
+    dems["__viable_floor__"] = floor.values
+    dems["__need_raw__"] = need_raw.values
+    dems[UNDER_FLOOR_COL] = (own_spend.values < floor.values).astype(float)
+
+    base = dems[SCORE_COL].clip(lower=0.0, upper=1.0).fillna(0.0)
+    dems[SCORE_COL] = (base * (1.0 + NEED_ALPHA * need_raw.values)).clip(lower=0.0, upper=1.0)
+    return dems
+
+
+def _floor_saturation_metric(allocations: pd.DataFrame) -> float:
+    """Fraction of dollars sent to candidates spending below their viable floor."""
+    if UNDER_FLOOR_COL not in allocations.columns or allocations.empty:
+        return 0.0
+    total = float(allocations["allocation"].sum())
+    if total <= 0:
+        return 0.0
+    under_dollars = float((allocations["allocation"] * allocations[UNDER_FLOOR_COL]).sum())
+    return under_dollars / total
+
+
+def _floor_saturation_with_ci(
+    dems: pd.DataFrame, n: int, reps: int, seed: int
+) -> tuple[float, tuple[float, float]]:
+    """Bootstrap CI of floor_saturation_efficiency at top-N model allocation."""
+    rng = np.random.default_rng(seed)
+    samples = np.empty(reps, dtype=float)
+    for i in range(reps):
+        boot = dems.sample(n=len(dems), replace=True, random_state=rng.integers(1, 10**9))
+        alloc = allocate(boot, score_col=SCORE_COL, n=n)
+        samples[i] = _floor_saturation_metric(alloc)
+    point = float(_floor_saturation_metric(allocate(dems, score_col=SCORE_COL, n=n)))
+    ci = (
+        round(float(np.percentile(samples, 2.5)), 4),
+        round(float(np.percentile(samples, 97.5)), 4),
+    )
+    return round(point, 4), ci
 
 
 def _pivotal_metric(allocations: pd.DataFrame) -> float:
@@ -390,6 +467,11 @@ def format_row(row: BacktestRow) -> str:
             f"  pivotal_dollar_share: {row.pivotal_dollar_share:.4f} "
             f"(95% CI [{row.pivotal_ci[0]:.4f}, {row.pivotal_ci[1]:.4f}])"
         )
+    if row.floor_saturation_efficiency is not None and row.floor_saturation_ci is not None:
+        lines.append(
+            f"  floor_saturation_efficiency: {row.floor_saturation_efficiency:.4f} "
+            f"(95% CI [{row.floor_saturation_ci[0]:.4f}, {row.floor_saturation_ci[1]:.4f}])"
+        )
     return "\n".join(lines)
 
 
@@ -423,10 +505,11 @@ def main() -> None:
                         help="candidate universe; default 'all' (Dems in any "
                              "contested two-party general); 'wikipedia' "
                              "restricts to Dems in Wikipedia-tracked races")
-    parser.add_argument("--combine", choices=("competitiveness", "base"),
+    parser.add_argument("--combine", choices=("competitiveness", "base", "impact"),
                         default="competitiveness",
                         help="score combination; 'base' adds chamber-control "
-                             "stakes (requires --model multi-quantile)")
+                             "stakes; 'impact' additionally adds the "
+                             "financial-need adjustment (requires --model multi-quantile)")
     parser.add_argument("--raw-dir", type=Path, default=Path("data/raw"),
                         help="raw data dir for chamber view (used by --combine base)")
     parser.add_argument("--headline-n", type=int, default=HEADLINE_N,

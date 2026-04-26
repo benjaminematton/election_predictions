@@ -76,6 +76,8 @@ def _make_row(**overrides) -> BacktestRow:
         headline_fund_ci=(0.20, 0.40),
         pivotal_dollar_share=None,
         pivotal_ci=None,
+        floor_saturation_efficiency=None,
+        floor_saturation_ci=None,
         bootstrap_reps=100,
         notes="",
         timestamp="2026-01-01T00:00:00+00:00",

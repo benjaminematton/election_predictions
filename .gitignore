@@ -36,6 +36,9 @@ data/processed/*
 # checked-in defaults for the deployed Streamlit app to read at startup).
 !data/processed/decile_thresholds.json
 !data/processed/phase7_summary.json
+# Phase 8 deployed-app data (baked once via scripts/bake_app_data.py;
+# Streamlit Cloud reads it from the repo on cold start)
+!data/processed/app_candidates_2024.parquet
 
 # Streamlit
 .streamlit/secrets.toml

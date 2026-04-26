@@ -41,6 +41,7 @@ data/processed/*
 !data/processed/app_candidates_2024.parquet
 !data/processed/audit_step0a_pivotal_2022.json
 !data/processed/audit_step0b_wayback_spike.json
+!data/processed/audit_paired_bootstrap.json
 
 # Streamlit
 .streamlit/secrets.toml

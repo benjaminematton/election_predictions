@@ -28,7 +28,8 @@ import numpy as np
 import pandas as pd
 
 from oath_score.constants import snapshot_date_for, SNAPSHOT_OFFSETS_DAYS, CYCLES
-from oath_score.ingest import census, fec, fec_ie, pvi, ratings, results
+from oath_score.ingest import census, fec, fec_ie, pvi, ratings, results, wayback_cook
+from oath_score.ingest.ratings import BACKFILLED_CYCLES
 
 DEM_PARTY_LABELS = frozenset({"DEM", "DEMOCRAT", "DEMOCRATIC", "DFL", "DEMOCRATIC-FARMER-LABOR"})
 REP_PARTY_LABELS = frozenset({"REP", "REPUBLICAN"})
@@ -64,7 +65,52 @@ def build_features(cycle: int, snapshot: str, raw_dir: Path) -> pd.DataFrame:
     fec_df = fec.fetch_fec(cycle, snap_date, raw_dir)
     ie_df = fec_ie.fetch_independent_expenditures(cycle, snap_date, raw_dir)
 
-    if rat_res.backfilled:
+    # For back-filled Wikipedia cycles (2014, 2016, 2018), prefer the Wayback
+    # Machine archive of cookpolitical.com which has contemporaneous ratings.
+    # This is the audit fix for Finding B (perfect-foresight leakage). Strategy:
+    # use Wayback ratings for Cook's per-district table; fall back to the
+    # back-filled Wikipedia frame for any district Wayback didn't cover (rare).
+    wayback_ts: str | None = None
+    wayback_used = False
+    if cycle in BACKFILLED_CYCLES:
+        try:
+            wb_res = wayback_cook.fetch_wayback_cook(cycle, snap_date, raw_dir)
+        except Exception as exc:
+            print(
+                f"[features] Wayback Cook lookup failed for cycle={cycle} "
+                f"snapshot={snap_date}: {exc.__class__.__name__}: {exc}. "
+                "Falling back to back-filled Wikipedia ratings (LEAKY)."
+            )
+        else:
+            print(
+                f"[features] using Wayback Cook ratings for cycle={cycle}: "
+                f"ts={wb_res.wayback_timestamp}, {len(wb_res.df)} districts, "
+                f"{wb_res.days_off_target} days from snapshot."
+            )
+            # Replace the cook_ordinal column on rat_df with Wayback values where
+            # we have them (keep CPVI and other columns from Wikipedia/Daily Kos).
+            wb_lookup = wb_res.df.set_index(["state_abbr", "district"])["cook_ordinal"]
+            rat_df = rat_df.set_index(["state_abbr", "district"]) if not rat_df.empty else pd.DataFrame()
+            # Merge: prefer Wayback cook_ordinal everywhere it exists
+            if "cook_ordinal" in rat_df.columns:
+                rat_df["cook_ordinal"] = rat_df["cook_ordinal"].combine_first(wb_lookup)
+                # Then overwrite where Wayback has a value (Wayback wins on overlap)
+                rat_df.loc[wb_lookup.index.intersection(rat_df.index), "cook_ordinal"] = wb_lookup
+            # Add districts only present in Wayback
+            new_idx = wb_lookup.index.difference(rat_df.index)
+            if len(new_idx):
+                add_df = pd.DataFrame({"cook_ordinal": wb_lookup.loc[new_idx]})
+                # Pad with NaN columns matching rat_df schema
+                for col in rat_df.columns:
+                    if col != "cook_ordinal":
+                        add_df[col] = pd.NA
+                rat_df = pd.concat([rat_df, add_df]).reset_index()
+            else:
+                rat_df = rat_df.reset_index()
+            wayback_ts = wb_res.wayback_timestamp
+            wayback_used = True
+
+    if rat_res.backfilled and not wayback_used:
         print(
             f"[features] WARNING: cycle={cycle} ratings page is back-filled "
             "(March 2021 creation); snapshot column reflects final ratings, "
@@ -97,8 +143,17 @@ def build_features(cycle: int, snapshot: str, raw_dir: Path) -> pd.DataFrame:
     # revision timestamp the Wikipedia ratings table came from, plus an explicit
     # leaky_ratings flag for back-filled cycles. The integration test enforces
     # that leaky cycles carry the flag and that clean cycles satisfy ts <= snapshot.
-    df["ratings_revision_ts"] = rat_res.revision_timestamp
-    df["leaky_ratings"] = bool(rat_res.backfilled)
+    if wayback_used:
+        # Wayback ratings are contemporaneous; use the Wayback timestamp as the
+        # audit ts and clear the leaky flag (the leakage source has been
+        # replaced).
+        df["ratings_revision_ts"] = wayback_ts
+        df["leaky_ratings"] = False
+        df["ratings_source"] = "wayback_cook"
+    else:
+        df["ratings_revision_ts"] = rat_res.revision_timestamp
+        df["leaky_ratings"] = bool(rat_res.backfilled)
+        df["ratings_source"] = "wikipedia"
 
     _assert_invariants(df)
     return df

@@ -1,0 +1,39 @@
+{
+  "paired_bootstrap": {
+    "reps": 1000,
+    "train_cycles": [
+      2016,
+      2022
+    ],
+    "training_data_quality": "Wayback-cleaned 2016 ratings (was back-filled Wikipedia)",
+    "test_cycle": 2024,
+    "n": 10,
+    "method": "paired bootstrap of (model - cook) close-race share at top-N=10",
+    "per_snapshot": {
+      "T-110": {
+        "point": 0.04041048042937619,
+        "ci95": [
+          -0.24515114849548497,
+          0.30000000000000004
+        ],
+        "P_model_better": 0.587
+      },
+      "T-60": {
+        "point": -0.0017370086034881166,
+        "ci95": [
+          -0.335447367522225,
+          0.30000000000000004
+        ],
+        "P_model_better": 0.492
+      },
+      "T-20": {
+        "point": -0.006940785127851051,
+        "ci95": [
+          -0.3816064455796131,
+          0.30000000000000004
+        ],
+        "P_model_better": 0.488
+      }
+    }
+  }
+}

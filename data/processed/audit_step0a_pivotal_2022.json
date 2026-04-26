@@ -1,0 +1,48 @@
+{
+  "metric_definitions": {
+    "WinnableLoss": "Dem candidates who lost by <5% in 2022 (14 Dems)",
+    "PivotK5": "Dems in 5 closest R-won 2022 races (CO-3, CA-13, MI-10, IA-3, AZ-6)",
+    "PivotK10": "Dems in 10 closest R-won 2022 races",
+    "PivotK20": "Dems in 20 closest R-won 2022 races"
+  },
+  "pivotal_share_at_n_10": {
+    "comp_only": {
+      "winnable_loss": 0.1688,
+      "pivot_k5": 0.0,
+      "pivot_k10": 0.1688,
+      "pivot_k20": 0.1688
+    },
+    "base": {
+      "winnable_loss": 0.0,
+      "pivot_k5": 0.0,
+      "pivot_k10": 0.0,
+      "pivot_k20": 0.0876
+    },
+    "impact": {
+      "winnable_loss": 0.0,
+      "pivot_k5": 0.0,
+      "pivot_k10": 0.0,
+      "pivot_k20": 0.0
+    },
+    "fund": {
+      "winnable_loss": 0.0535,
+      "pivot_k5": 0.0,
+      "pivot_k10": 0.0,
+      "pivot_k20": 0.0535
+    },
+    "cook_final": {
+      "winnable_loss": 0.0,
+      "pivot_k5": 0.0,
+      "pivot_k10": 0.0,
+      "pivot_k20": 0.0
+    },
+    "oracle": {
+      "winnable_loss": 0.7,
+      "pivot_k5": 0.4,
+      "pivot_k10": 0.5,
+      "pivot_k20": 0.7
+    }
+  },
+  "verdict": "OPTION 2 (comp-only headline). Stakes does not improve any pivotal-flavor metric \u2014 comp-only ties or beats comp*stakes on all four definitions tried. Impact (with need) is uniformly worst.",
+  "note": "Multiplicative combine compresses correlated sub-scores; stakes is methodologically interesting but kept for completeness / per-candidate detail panel, not headline."
+}

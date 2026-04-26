@@ -55,8 +55,16 @@ def allocate(
     score = pd.to_numeric(df[score_col], errors="coerce").fillna(0.0).clip(lower=0.0)
     df["__score__"] = score
 
-    # Sort and slice
-    top = df.nlargest(min(n, len(df)), "__score__").copy()
+    # Sort and slice. Deterministic tie-break by (state_abbr, district) so that
+    # benchmarks like Cook-final (which pile up many ties at the same ordinal,
+    # e.g. 22 Toss-ups all weighted 4) pick the same N rows on every run.
+    sort_cols = ["__score__"]
+    sort_asc = [False]
+    for col in ("state_abbr", "district"):
+        if col in df.columns:
+            sort_cols.append(col)
+            sort_asc.append(True)
+    top = df.sort_values(sort_cols, ascending=sort_asc).head(min(n, len(df))).copy()
     weights = top["__score__"].to_numpy(dtype=float)
 
     if need_col is not None:

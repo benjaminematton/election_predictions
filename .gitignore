@@ -39,6 +39,8 @@ data/processed/*
 # Phase 8 deployed-app data (baked once via scripts/bake_app_data.py;
 # Streamlit Cloud reads it from the repo on cold start)
 !data/processed/app_candidates_2024.parquet
+!data/processed/audit_step0a_pivotal_2022.json
+!data/processed/audit_step0b_wayback_spike.json
 
 # Streamlit
 .streamlit/secrets.toml

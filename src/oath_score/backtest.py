@@ -191,10 +191,16 @@ def _attach_cook_final(
     if "cook_ordinal" not in rdf.columns:
         return dems
 
-    cook_table = rdf[["state_abbr", "district", "cook_ordinal"]].rename(
-        columns={"cook_ordinal": COOK_FINAL_COL}
-    )
-    return dems.merge(cook_table, on=["state_abbr", "district"], how="left")
+    # Symmetric Toss-up-distance allocation weight. Raw Cook ordinal (1=Solid R,
+    # 4=Toss-up, 7=Solid D) used as a score-weighted allocation pulled Lean D (5)
+    # and Likely D (6) districts ahead of Toss-ups (4) — structurally biased
+    # against the benchmark we're trying to evaluate. Replace with `4 - |ord - 4|`
+    # clipped to [1, 4]: Toss-up=4, Lean=3, Likely=2, Solid=1. Symmetric, monotonic,
+    # ordinal-respecting.
+    cook = rdf[["state_abbr", "district", "cook_ordinal"]].copy()
+    cook[COOK_FINAL_COL] = (4 - (cook["cook_ordinal"] - 4).abs()).clip(lower=1)
+    cook = cook.drop(columns=["cook_ordinal"])
+    return dems.merge(cook, on=["state_abbr", "district"], how="left")
 
 
 def _filter_universe(df: pd.DataFrame, universe: UniverseChoice, *, naive: bool) -> pd.DataFrame:

@@ -1,0 +1,66 @@
+{
+  "verdict": "Wayback CDX spike SUCCEEDED for 2016 ratings.",
+  "time_spent_minutes": 90,
+  "kill_criterion_minutes": 240,
+  "snapshots_fetched": {
+    "T-110": {
+      "wayback_ts": "20160721152100",
+      "n_rows": 428,
+      "cache_path": "data/raw/wayback_cook/cook_2016_T-110_wayback_20160721152100.parquet",
+      "bucket_counts": {
+        "Solid Republican": 199,
+        "Solid Democratic": 175,
+        "Republican Toss Up": 17,
+        "Lean Republican": 11,
+        "Likely Republican": 11,
+        "Likely Democratic": 6,
+        "Lean Democratic": 6,
+        "Democratic Toss Up": 3
+      }
+    },
+    "T-60": {
+      "wayback_ts": "20160909000728",
+      "n_rows": 428,
+      "cache_path": "data/raw/wayback_cook/cook_2016_T-60_wayback_20160909000728.parquet",
+      "bucket_counts": {
+        "Solid Republican": 199,
+        "Solid Democratic": 175,
+        "Republican Toss Up": 16,
+        "Lean Republican": 11,
+        "Likely Republican": 11,
+        "Lean Democratic": 7,
+        "Likely Democratic": 6,
+        "Democratic Toss Up": 3
+      }
+    },
+    "T-20": {
+      "wayback_ts": "20161019105718",
+      "n_rows": 428,
+      "cache_path": "data/raw/wayback_cook/cook_2016_T-20_wayback_20161019105718.parquet",
+      "bucket_counts": {
+        "Solid Republican": 198,
+        "Solid Democratic": 175,
+        "Republican Toss Up": 15,
+        "Lean Republican": 13,
+        "Likely Republican": 12,
+        "Likely Democratic": 6,
+        "Lean Democratic": 6,
+        "Democratic Toss Up": 3
+      }
+    }
+  },
+  "comparison_to_backfilled_wikipedia_at_T_60": {
+    "wayback_2016_T60_districts": 428,
+    "backfilled_wikipedia_2016_T60_districts": 58,
+    "overlap_districts": 56,
+    "rating_disagreements_in_overlap": 40,
+    "interpretation": "Wayback covers ~all 435 districts vs Wikipedia back-filled covers ~58. Of 56 overlapping districts, 40 have different ratings -- confirms back-fill leakage was material, not theoretical."
+  },
+  "integration_status": "Spike complete; raw HTML and parsed parquets cached at data/raw/wayback_cook/. Full integration into features.py deferred to a Phase 9 follow-up - the cached data is the next session's starting point.",
+  "follow_up_work": [
+    "Add ingest/wayback_cook.py module wrapping this spike parser",
+    "Modify features.py to prefer Wayback ratings over Wikipedia for BACKFILLED_CYCLES",
+    "Re-bake 2014/2016/2018 features parquets with Wayback ratings",
+    "Re-run headline backtest with no-leak training set; report numbers"
+  ]
+}

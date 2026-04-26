@@ -93,6 +93,13 @@ def build_features(cycle: int, snapshot: str, raw_dir: Path) -> pd.DataFrame:
     df["snapshot"] = snapshot
     df["snapshot_date"] = snap_date.isoformat()
 
+    # Audit columns for tests/test_leakage_integration.py: every row records the
+    # revision timestamp the Wikipedia ratings table came from, plus an explicit
+    # leaky_ratings flag for back-filled cycles. The integration test enforces
+    # that leaky cycles carry the flag and that clean cycles satisfy ts <= snapshot.
+    df["ratings_revision_ts"] = rat_res.revision_timestamp
+    df["leaky_ratings"] = bool(rat_res.backfilled)
+
     _assert_invariants(df)
     return df
 

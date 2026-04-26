@@ -36,10 +36,17 @@ WIKI_INDEX = "https://en.wikipedia.org/w/index.php"
 
 PAGE_TITLE_FMT = "{cycle}_United_States_House_of_Representatives_election_ratings"
 
-# Cycles whose ratings pages were created retroactively (March 2021) and
-# therefore have no real snapshot history. Determined empirically — see
-# Phase 1 spike notes in .claude/plans/phase2.md.
-BACKFILLED_CYCLES: frozenset[int] = frozenset({2014, 2016})
+# Cycles whose Wikipedia ratings pages were created after the cycle's election
+# date, so any snapshot query falls back to the earliest revision (= the final
+# back-filled ratings). Determined empirically by querying the MediaWiki revision
+# API — page creation timestamps:
+#   2014: 2021-03-20  (back-filled — original spike finding)
+#   2016: 2021-03-20  (back-filled — original spike finding)
+#   2018: 2018-12-29  (back-filled — 7 weeks AFTER Nov 6, 2018 election; added 2026-04-25 audit)
+#   2020: 2019-09-21  (clean — pre-cycle creation, real snapshot revisions exist)
+#   2022: 2021-10-02  (clean)
+#   2024: 2023-02-03  (clean)
+BACKFILLED_CYCLES: frozenset[int] = frozenset({2014, 2016, 2018})
 
 
 # ---------- public API ----------

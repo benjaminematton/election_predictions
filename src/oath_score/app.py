@@ -237,17 +237,34 @@ def _detail_section(filtered: pd.DataFrame) -> None:
     row_idx = options.index(selected)
     cand = filtered.iloc[row_idx]
 
-    cols = st.columns(3)
-    cols[0].metric("Competitiveness", f"{cand['competitiveness']:.3f}",
-                   help="P(margin within ±5%) from multi-quantile regression.")
-    cols[1].metric("Stakes", f"{cand['stakes_normalized']:.3f}",
-                   help="Min-max normalized chamber-pivot probability from MC.")
-    cols[2].metric("Need", f"{cand['need_raw']:.3f}",
-                   help="(viable_floor − own_spend) / viable_floor, clipped to [0, 1].")
-
+    # Headline score: competitiveness alone. Per the audit (README "Validity
+    # checks" + decision #4), the multiplicative impact combine reduces
+    # close-race share and ties Cook instead of beating it. Competitiveness is
+    # the load-bearing component; stakes and need ship below as methodology
+    # sub-scores.
     cols = st.columns(2)
-    cols[0].metric("Impact (1–10)", int(cand["impact_decile"]))
-    cols[1].metric("Impact (continuous)", f"{cand['impact_continuous']:.3f}")
+    cols[0].metric("Headline score (1–10, competitiveness-driven)", int(cand["impact_decile"]))
+    cols[1].metric("Competitiveness P(|margin| < 5%)", f"{cand['competitiveness']:.3f}",
+                   help="From multi-quantile regression. Drives the headline.")
+
+    with st.expander("Methodology breakdown — three Oath sub-scores"):
+        st.caption(
+            "Stakes and need are reported here for completeness, but per the "
+            "audit they don't earn their keep on the close-race-share metric "
+            "(stakes correlates 0.86 with competitiveness; geometric-mean "
+            "combine reduces headline by ~9pp). Headline above is "
+            "competitiveness-driven."
+        )
+        sub = st.columns(3)
+        sub[0].metric("Competitiveness", f"{cand['competitiveness']:.3f}",
+                      help="P(margin within ±5%) from multi-quantile regression.")
+        sub[1].metric("Stakes (chamber-pivotal)", f"{cand['stakes_normalized']:.3f}",
+                      help="Min-max normalized chamber-pivot probability from MC.")
+        sub[2].metric("Need (under viable floor)", f"{cand['need_raw']:.3f}",
+                      help="(viable_floor − own_spend) / viable_floor, clipped to [0, 1].")
+        st.metric("Combined impact_continuous (sqrt(comp·stakes)·(1+α·need))",
+                  f"{cand['impact_continuous']:.3f}",
+                  help="The three-component combine. Headline uses competitiveness alone.")
 
     # Fundraising vs viable floor
     fund_df = pd.DataFrame({

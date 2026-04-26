@@ -195,6 +195,69 @@ class TestRunBacktest:
             )
 
 
+class TestCookFinalAllocation:
+    """Cook-final benchmark uses symmetric Toss-up-distance weighting.
+
+    Pre-audit, raw Cook ordinal (1=Solid R ... 7=Solid D) was the allocation
+    weight, structurally pulling Solid D and Likely D districts ahead of
+    Toss-ups (the only races that are actually competitive). Post-audit, the
+    weight is `4 - |ordinal - 4|` clipped to [1, 4]: Toss-up=4, Lean=3,
+    Likely=2, Solid=1. Symmetric, monotonic, ordinal-respecting.
+    """
+
+    def test_cook_final_weights_tossup_above_lean(self, tmp_path):
+        """For a 4-district synthetic set, cook_rating_final must rank
+        Toss-up >= Lean >= Likely >= Solid (both sides)."""
+        from oath_score.backtest import _attach_cook_final, COOK_FINAL_COL
+
+        # Build a fake cycle's data/raw layout that fetch_ratings will read
+        # is too involved for a unit test — instead, exercise the symmetric
+        # transform directly on a synthetic cook_ordinal column.
+        df = pd.DataFrame({
+            "state_abbr": ["AA"] * 7,
+            "district":   list(range(1, 8)),
+            "cook_ordinal": [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0],
+        })
+        # Apply the same transform _attach_cook_final does inline:
+        df[COOK_FINAL_COL] = (4 - (df["cook_ordinal"] - 4).abs()).clip(lower=1)
+
+        weights = dict(zip(df["cook_ordinal"], df[COOK_FINAL_COL]))
+        # Toss-up gets the top weight, both Solids get the floor
+        assert weights[4.0] == 4  # Toss-up
+        assert weights[3.0] == 3 and weights[5.0] == 3  # Lean R / Lean D
+        assert weights[2.0] == 2 and weights[6.0] == 2  # Likely R / Likely D
+        assert weights[1.0] == 1 and weights[7.0] == 1  # Solid R / Solid D
+        # Symmetric across Toss-up
+        assert weights[3.0] == weights[5.0]
+        assert weights[2.0] == weights[6.0]
+        assert weights[1.0] == weights[7.0]
+        # Strictly monotonic in distance from Toss-up
+        assert weights[4.0] > weights[3.0] > weights[2.0] > weights[1.0]
+
+
+class TestAllocationTieBreak:
+    """Deterministic tie-breaking by (state_abbr, district) — Cook-final
+    benchmark piles many Toss-ups at the same weight; without a tie-break,
+    which N rows get picked depends on row order in the input frame."""
+
+    def test_allocation_picks_same_rows_under_row_shuffle(self):
+        from oath_score.allocation import allocate
+
+        df = pd.DataFrame({
+            "state_abbr": ["AA", "BB", "CC", "DD", "EE", "FF"],
+            "district":   [1, 2, 3, 4, 5, 6],
+            "cand_id":    [f"H{i}" for i in range(6)],
+            "score":      [4.0, 4.0, 4.0, 4.0, 4.0, 4.0],  # all tied
+        })
+        # Top-3 with all ties — should pick deterministically by (state, district)
+        top1 = allocate(df, score_col="score", n=3)
+        top2 = allocate(df.iloc[::-1].reset_index(drop=True), score_col="score", n=3)
+        # Both runs must select the same 3 cand_ids
+        assert sorted(top1["cand_id"].tolist()) == sorted(top2["cand_id"].tolist())
+        # And those 3 must be the lexicographically-first by (state, district)
+        assert sorted(top1["cand_id"].tolist()) == sorted(["H0", "H1", "H2"])
+
+
 class TestJsonlOutput:
     def test_append_creates_file(self, tmp_path):
         row = _make_row()

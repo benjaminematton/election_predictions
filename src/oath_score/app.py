@@ -84,8 +84,10 @@ def _headline() -> None:
     st.markdown(
         "A 1–10 score per Democratic House candidate combining **competitiveness**, "
         "**chamber-control stakes**, and **financial need**. Backtested on held-out "
-        "2024 results: **89.8% of allocated dollars** to <5%-margin races at T-60 days "
-        f"before Election Day vs **29.9% for Cook Political Report's final ratings** "
+        "2024 results: top-decile recommendations targeted **<5%-margin races in "
+        "~80–90% of allocated dollars** across the T-110 / T-60 / T-20 snapshots — "
+        "performance comparable to Cook Political Report's final ratings under identical "
+        f"allocation logic, with bootstrap-validated CIs and full method transparency "
         "([methodology]({}))."
         .format(HEADLINE_NOTEBOOK)
     )
@@ -318,10 +320,12 @@ def _about_section() -> None:
 * MIT Election Lab (district results)
 * Wikipedia revision history (snapshot-aware Cook/Sabato/Inside ratings)
 
-**Backtest highlights** (held-out 2024, train on 2016 + 2022):
-* T-60: top-decile recommendations targeted <5% races in **89.8% of cases** vs **29.9% for Cook's final ratings** (+60pp lift).
-* T-110: 100% close-race share (with wider bootstrap CI).
-* T-20: 80.8% close-race share, still +51pp over Cook-final.
+**Backtest highlights** (held-out 2024, train on 2016 + 2022, top-N = 10):
+* T-110 close-race share: ~100% (wider bootstrap CI; small denominator at this snapshot).
+* T-60 close-race share: ~89.8%.
+* T-20 close-race share: ~80.8%.
+
+The competitiveness-only model substantially outperforms the fundraising-proportional baseline (~26.7% at T-60) on the close-race metric. Against **Cook Political Report's final ratings** under identical allocation logic, the **competitiveness sub-score** alone clears Cook by a wide margin at every snapshot, but the **three-component combined impact score** (competitiveness × stakes × need) trades close-race precision for chamber-pivotal coverage and ends up roughly tied with Cook on the close-race metric. The headline above the page reflects the audit-honest reading: comparable performance, with model transparency and CI discipline as the meaningful differentiators rather than a single delta.
 
 **Repo & methodology:** [GitHub]({GITHUB_URL}) · [Improvement curves notebook]({HEADLINE_NOTEBOOK}) · [Calibration results]({CALIBRATION_NOTEBOOK}).
 
